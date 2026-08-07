@@ -1,0 +1,1120 @@
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { supabase } from "./supabase.js";
+
+/* ============================================================
+   FABEL — a Dixit-style storytelling card game
+   Transport: Supabase (Postgres + Realtime). Every action applies
+   directly and atomically from the acting player's own device —
+   there's no "host" driving a queue, so no single tab can stall
+   the game for everyone else.
+   ============================================================ */
+
+const HAND_SIZE = 6;
+const WIN_SCORE = 30;
+const FALLBACK_POLL_MS = 5000; // belt-and-braces if a realtime event is ever missed
+const PHASE_TIMER_S = 45; // soft, informational nudge only — never blocks a player
+const SEAT_KEY = "fabel:seat";
+
+const C = {
+  night: "#0E1F26",
+  night2: "#16323C",
+  night3: "#1F454F",
+  bone: "#F2EAE0",
+  amber: "#F0B458",
+  violet: "#B98CC4",
+  muted: "#7C9BA3",
+  green: "#7FD1C1",
+};
+
+/* ---------- identity: a real browser-local id, per profile/device ---------- */
+function getDeviceId() {
+  try {
+    let id = localStorage.getItem("fabel:device");
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem("fabel:device", id);
+    }
+    return id;
+  } catch {
+    return crypto.randomUUID();
+  }
+}
+function saveSeat(code, player) {
+  try {
+    localStorage.setItem(SEAT_KEY, JSON.stringify({ code, id: player.id, name: player.name }));
+  } catch {}
+}
+function loadSeat() {
+  try {
+    return JSON.parse(localStorage.getItem(SEAT_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+function clearSeat() {
+  try {
+    localStorage.removeItem(SEAT_KEY);
+  } catch {}
+}
+
+/* ---------- utils ---------- */
+const mulberry32 = (a) => () => {
+  a |= 0;
+  a = (a + 0x6d2b79f5) | 0;
+  let t = Math.imul(a ^ (a >>> 15), 1 | a);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+const shuffle = (arr, rnd = Math.random) => {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+};
+const code4 = () => {
+  const L = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+  return Array.from({ length: 4 }, () => L[Math.floor(Math.random() * L.length)]).join("");
+};
+
+/* ---------- procedural card art (placeholder deck) ---------- */
+const SILHOUETTES = [
+  "M50 78 L50 52 M50 60 L40 68 M50 60 L60 68 M50 52 a5 5 0 1 1 0.1 0",
+  "M35 80 Q50 30 65 80 Z",
+  "M40 80 L40 45 L60 45 L60 80 Z M46 60 a2 2 0 1 1 0.1 0",
+  "M30 80 Q50 68 70 80 L66 72 Q50 62 34 72 Z M50 66 L50 40 L64 46 L50 52",
+  "M32 80 L44 80 L44 68 L56 68 L56 56 L68 56 L68 44",
+  "M50 46 a12 12 0 1 1 -0.1 0 M50 34 L50 24 M50 58 L50 72",
+  "M38 74 Q50 40 62 74 M50 40 L50 30",
+  "M28 62 q10 -12 20 0 q10 12 20 0 q10 -12 14 0",
+  "M44 80 L44 40 a6 6 0 1 1 12 0 L56 80 M38 56 L62 56",
+  "M50 30 L62 56 L50 82 L38 56 Z",
+];
+
+function CardArt({ seed, url }) {
+  if (url) {
+    return (
+      <img
+        src={url}
+        alt=""
+        style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+        draggable={false}
+      />
+    );
+  }
+  const r = mulberry32(seed * 7919 + 13);
+  const hue = Math.floor(r() * 360);
+  const hue2 = (hue + 40 + Math.floor(r() * 120)) % 360;
+  const moonX = 20 + r() * 60;
+  const moonY = 15 + r() * 25;
+  const moonR = 6 + r() * 12;
+  const sil = SILHOUETTES[Math.floor(r() * SILHOUETTES.length)];
+  const stars = Array.from({ length: 14 }, () => [r() * 100, r() * 60, r() * 1.1 + 0.3]);
+  const h1 = 62 + r() * 10;
+  const h2 = 74 + r() * 10;
+  const gid = `g${seed}`;
+  return (
+    <svg viewBox="0 0 100 140" style={{ width: "100%", height: "100%", display: "block" }}>
+      <defs>
+        <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={`hsl(${hue},55%,${18 + r() * 14}%)`} />
+          <stop offset="55%" stopColor={`hsl(${hue2},48%,${34 + r() * 16}%)`} />
+          <stop offset="100%" stopColor={`hsl(${(hue2 + 30) % 360},40%,${14 + r() * 10}%)`} />
+        </linearGradient>
+      </defs>
+      <rect width="100" height="140" fill={`url(#${gid})`} />
+      {stars.map(([x, y, s], i) => (
+        <circle key={i} cx={x} cy={y} r={s} fill="#fff" opacity={0.5 + r() * 0.4} />
+      ))}
+      <circle cx={moonX} cy={moonY} r={moonR} fill="#fff" opacity="0.82" />
+      <circle cx={moonX + moonR * 0.4} cy={moonY - moonR * 0.25} r={moonR * 0.9} fill={`hsl(${hue},55%,22%)`} opacity="0.55" />
+      <path
+        d={`M0 ${h1} Q 25 ${h1 - 14} 50 ${h1} T 100 ${h1} L100 140 L0 140 Z`}
+        fill={`hsl(${hue2},40%,${18 + r() * 8}%)`}
+        opacity="0.85"
+      />
+      <g transform={`translate(0 ${h2 - 78}) scale(1)`}>
+        <path d={sil} fill="none" stroke={`hsl(${hue},20%,88%)`} strokeWidth="2.2" strokeLinecap="round" opacity="0.9" />
+      </g>
+      <path
+        d={`M0 ${h2 + 6} Q 30 ${h2 - 4} 60 ${h2 + 8} T 100 ${h2 + 4} L100 140 L0 140 Z`}
+        fill={`hsl(${(hue + 200) % 360},35%,12%)`}
+      />
+    </svg>
+  );
+}
+
+function CardBack() {
+  return (
+    <svg viewBox="0 0 100 140" style={{ width: "100%", height: "100%", display: "block" }}>
+      <rect width="100" height="140" fill={C.night2} />
+      <circle cx="50" cy="70" r="26" fill="none" stroke={C.amber} strokeWidth="1.2" opacity="0.55" />
+      <circle cx="50" cy="70" r="17" fill="none" stroke={C.violet} strokeWidth="1" opacity="0.5" />
+      <circle cx="50" cy="70" r="6" fill={C.amber} opacity="0.75" />
+      <path d="M20 70 Q50 46 80 70 Q50 94 20 70 Z" fill="none" stroke={C.bone} strokeWidth="1" opacity="0.35" />
+    </svg>
+  );
+}
+
+/* ---------- game logic (pure — same rules as before) ---------- */
+function freshCore(code, host, deckUrls) {
+  return {
+    code,
+    hostId: host.id,
+    phase: "lobby",
+    round: 0,
+    players: [{ id: host.id, name: host.name, score: 0 }],
+    deckUrls: deckUrls || [],
+    deckSize: 84,
+    pile: [],
+    discard: [],
+    hands: {},
+    storytellerIdx: 0,
+    clue: "",
+    storytellerCard: null,
+    submissions: [],
+    votes: {},
+    result: null,
+    stamp: Date.now(),
+  };
+}
+
+function deckCards(core) {
+  const n = core.deckUrls.length ? core.deckUrls.length : core.deckSize;
+  return Array.from({ length: n }, (_, i) => i);
+}
+
+function drawTo(core, playerId) {
+  const hand = core.hands[playerId] || [];
+  while (hand.length < HAND_SIZE) {
+    if (!core.pile.length) {
+      core.pile = shuffle(core.discard);
+      core.discard = [];
+      if (!core.pile.length) break;
+    }
+    hand.push(core.pile.pop());
+  }
+  core.hands[playerId] = hand;
+}
+
+function startGame(core) {
+  core.pile = shuffle(deckCards(core));
+  core.discard = [];
+  core.hands = {};
+  core.players.forEach((p) => {
+    p.score = 0;
+    drawTo(core, p.id);
+  });
+  core.round = 1;
+  core.storytellerIdx = 0;
+  core.phase = "clue";
+  core.clue = "";
+  core.storytellerCard = null;
+  core.submissions = [];
+  core.votes = {};
+  core.result = null;
+}
+
+function tally(core) {
+  const st = core.players[core.storytellerIdx];
+  const stCard = core.storytellerCard;
+  const guessers = core.players.filter((p) => p.id !== st.id);
+  const correct = guessers.filter((p) => core.votes[p.id] === stCard);
+  const gains = {};
+  core.players.forEach((p) => (gains[p.id] = 0));
+
+  const allOrNone = correct.length === 0 || correct.length === guessers.length;
+  if (allOrNone) {
+    guessers.forEach((p) => (gains[p.id] += 2));
+  } else {
+    gains[st.id] += 3;
+    correct.forEach((p) => (gains[p.id] += 3));
+  }
+  Object.entries(core.votes).forEach(([, card]) => {
+    if (card === stCard) return;
+    const owner = core.submissions.find((s) => s.card === card)?.playerId;
+    if (owner && owner !== st.id) gains[owner] += 1;
+  });
+
+  core.players.forEach((p) => (p.score += gains[p.id]));
+  core.result = { gains, stCard, correctIds: correct.map((p) => p.id), allOrNone };
+  core.phase = "reveal";
+}
+
+function nextRound(core) {
+  core.submissions.forEach((s) => core.discard.push(s.card));
+  core.players.forEach((p) => drawTo(core, p.id));
+  if (core.players.some((p) => p.score >= WIN_SCORE)) {
+    core.phase = "end";
+    return;
+  }
+  core.round += 1;
+  core.storytellerIdx = (core.storytellerIdx + 1) % core.players.length;
+  core.phase = "clue";
+  core.clue = "";
+  core.storytellerCard = null;
+  core.submissions = [];
+  core.votes = {};
+  core.result = null;
+}
+
+/* Applies one player's action directly against the current state.
+   No queue, no seq numbers — Postgres's own atomic UPDATE (below) is what
+   keeps two simultaneous actions from clobbering each other, so this just
+   needs to be correct for a single application. */
+function applyAction(core, pid, act) {
+  const st = core.players[core.storytellerIdx];
+
+  if (act.type === "join") {
+    if (core.phase !== "lobby") return false;
+    const existing = core.players.find((p) => p.id === pid);
+    if (existing) existing.name = act.name;
+    else core.players.push({ id: pid, name: act.name, score: 0 });
+    return true;
+  }
+  if (act.type === "leave") {
+    core.players = core.players.filter((p) => p.id !== pid);
+    delete core.hands[pid];
+    if (core.storytellerIdx >= core.players.length) core.storytellerIdx = 0;
+    return true;
+  }
+  if (act.type === "start") {
+    if (core.phase !== "lobby" || pid !== core.hostId) return false;
+    const need = core.players.length * HAND_SIZE + 4;
+    const size = core.deckUrls.length || core.deckSize;
+    if (size < need) return false;
+    startGame(core);
+    return true;
+  }
+  if (act.round !== core.round || act.phase !== core.phase) return false;
+
+  if (act.type === "clue" && pid === st.id) {
+    core.clue = act.clue.slice(0, 120);
+    core.storytellerCard = act.card;
+    core.hands[pid] = core.hands[pid].filter((c) => c !== act.card);
+    core.submissions = [{ playerId: pid, card: act.card }];
+    core.phase = "submit";
+  } else if (act.type === "submit" && pid !== st.id) {
+    if (core.submissions.some((s) => s.playerId === pid)) return false;
+    core.submissions.push({ playerId: pid, card: act.card });
+    core.hands[pid] = core.hands[pid].filter((c) => c !== act.card);
+    if (core.submissions.length === core.players.length) {
+      core.submissions = shuffle(core.submissions);
+      core.phase = "vote";
+    }
+  } else if (act.type === "vote" && pid !== st.id) {
+    if (core.votes[pid] !== undefined) return false;
+    core.votes[pid] = act.card;
+    if (Object.keys(core.votes).length === core.players.length - 1) tally(core);
+  } else if (act.type === "next" && pid === core.hostId) {
+    nextRound(core);
+  } else if (act.type === "restart" && pid === core.hostId) {
+    startGame(core);
+  } else {
+    return false;
+  }
+  return true;
+}
+
+/* ---------- Supabase row <-> app state mapping ---------- */
+function rowToState(row) {
+  return {
+    code: row.code,
+    hostId: row.host_id,
+    phase: row.phase,
+    round: row.round,
+    players: row.players || [],
+    deckUrls: row.deck_urls || [],
+    deckSize: row.deck_size,
+    pile: row.pile || [],
+    discard: row.discard || [],
+    hands: row.hands || {},
+    storytellerIdx: row.storyteller_idx,
+    clue: row.clue || "",
+    storytellerCard: row.storyteller_card,
+    submissions: row.submissions || [],
+    votes: row.votes || {},
+    result: row.result,
+    stamp: Number(row.stamp),
+  };
+}
+function stateToRow(s) {
+  return {
+    code: s.code,
+    host_id: s.hostId,
+    phase: s.phase,
+    round: s.round,
+    players: s.players,
+    deck_urls: s.deckUrls,
+    deck_size: s.deckSize,
+    pile: s.pile,
+    discard: s.discard,
+    hands: s.hands,
+    storyteller_idx: s.storytellerIdx,
+    clue: s.clue,
+    storyteller_card: s.storytellerCard,
+    submissions: s.submissions,
+    votes: s.votes,
+    result: s.result,
+    stamp: s.stamp,
+  };
+}
+
+/* Fetch the room, apply a mutation, and write it back with an atomic
+   compare-and-swap on `stamp` (Postgres's WHERE clause guarantees this —
+   no separate lock or host needed). If someone else wrote in between,
+   retry against the fresh state a few times before giving up. */
+async function withRoom(code, mutate, tries = 6) {
+  for (let i = 0; i < tries; i++) {
+    const { data: row, error } = await supabase.from("rooms").select("*").eq("code", code).single();
+    if (error || !row) return { ok: false, reason: "not-found" };
+    const state = rowToState(row);
+    const changed = mutate(state);
+    if (!changed) return { ok: false, reason: "rejected", state };
+    state.stamp = Date.now();
+    const { data: updated, error: upErr } = await supabase
+      .from("rooms")
+      .update(stateToRow(state))
+      .eq("code", code)
+      .eq("stamp", row.stamp)
+      .select()
+      .single();
+    if (!upErr && updated) return { ok: true, state: rowToState(updated) };
+    await new Promise((r) => setTimeout(r, 120 + Math.random() * 220));
+  }
+  return { ok: false, reason: "conflict" };
+}
+
+/* ============================================================
+   UI
+   ============================================================ */
+
+function useFonts() {
+  useEffect(() => {
+    const l = document.createElement("link");
+    l.rel = "stylesheet";
+    l.href =
+      "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,600&family=Inter:wght@400;500;600&display=swap";
+    document.head.appendChild(l);
+    return () => {
+      try {
+        document.head.removeChild(l);
+      } catch {}
+    };
+  }, []);
+}
+
+const Btn = ({ children, onClick, disabled, tone = "amber", small }) => (
+  <button
+    onClick={onClick}
+    disabled={disabled}
+    style={{
+      fontFamily: "Inter, system-ui, sans-serif",
+      fontWeight: 600,
+      fontSize: small ? 13 : 15,
+      padding: small ? "8px 14px" : "12px 22px",
+      borderRadius: 999,
+      border: "none",
+      cursor: disabled ? "not-allowed" : "pointer",
+      opacity: disabled ? 0.4 : 1,
+      background: tone === "amber" ? C.amber : tone === "ghost" ? "transparent" : C.night3,
+      color: tone === "amber" ? C.night : C.bone,
+      boxShadow: tone === "ghost" ? `inset 0 0 0 1px ${C.muted}66` : "none",
+      transition: "transform .12s ease, opacity .12s ease",
+    }}
+    onMouseDown={(e) => (e.currentTarget.style.transform = "scale(.97)")}
+    onMouseUp={(e) => (e.currentTarget.style.transform = "scale(1)")}
+    onMouseLeave={(e) => (e.currentTarget.style.transform = "scale(1)")}
+  >
+    {children}
+  </button>
+);
+
+function Card({ seed, url, selected, dim, onClick, badge, width = 132 }) {
+  return (
+    <div
+      onClick={onClick}
+      role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      onKeyDown={(e) => onClick && (e.key === "Enter" || e.key === " ") && onClick()}
+      style={{
+        position: "relative",
+        width,
+        aspectRatio: "5 / 7",
+        borderRadius: 10,
+        overflow: "hidden",
+        cursor: onClick ? "pointer" : "default",
+        outline: selected ? `3px solid ${C.amber}` : `1px solid ${C.muted}44`,
+        outlineOffset: selected ? 2 : 0,
+        opacity: dim ? 0.42 : 1,
+        transform: selected ? "translateY(-6px)" : "none",
+        transition: "transform .16s ease, opacity .16s ease",
+        flex: "0 0 auto",
+        background: C.night2,
+      }}
+    >
+      <CardArt seed={seed} url={url} />
+      {badge && (
+        <div
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            bottom: 0,
+            padding: "6px 8px",
+            fontSize: 11,
+            fontFamily: "Inter, sans-serif",
+            fontWeight: 600,
+            color: C.bone,
+            background: "linear-gradient(transparent, rgba(0,0,0,.85))",
+          }}
+        >
+          {badge}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const linkBtnStyle = {
+  marginLeft: 12,
+  background: "none",
+  border: "none",
+  color: C.muted,
+  fontSize: 11,
+  cursor: "pointer",
+  letterSpacing: 1,
+  textDecoration: "underline",
+};
+
+function Header({ code, display, round, onLeave, onHelp }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+      <span style={{ ...display, fontSize: 24 }}>Fabel</span>
+      <span style={{ fontSize: 12, color: C.muted, letterSpacing: 2 }}>
+        {round ? `ROUND ${round} · ` : ""}
+        {code}
+        {onHelp && (
+          <button onClick={onHelp} style={linkBtnStyle}>
+            RULES
+          </button>
+        )}
+        {onLeave && (
+          <button onClick={onLeave} style={linkBtnStyle}>
+            LEAVE
+          </button>
+        )}
+      </span>
+    </div>
+  );
+}
+
+function HelpPanel({ onClose, display }) {
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(6,14,18,.72)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 50,
+        padding: 16,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          maxWidth: 440,
+          width: "100%",
+          background: C.night2,
+          borderRadius: 16,
+          padding: "26px 24px",
+          boxShadow: "0 20px 60px rgba(0,0,0,.5)",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <span style={{ ...display, fontSize: 22 }}>How to play</span>
+          <button
+            onClick={onClose}
+            style={{ background: "none", border: "none", color: C.muted, fontSize: 22, cursor: "pointer", lineHeight: 1 }}
+          >
+            ×
+          </button>
+        </div>
+        <ol style={{ paddingLeft: 18, marginTop: 16, fontSize: 14, lineHeight: 1.7, color: C.bone }}>
+          <li>The <b>storyteller</b> picks a card and gives a one-line clue — a word, a phrase, a sound.</li>
+          <li>Everyone else secretly picks a card from their own hand that could also fit that clue.</li>
+          <li>All chosen cards are shuffled and shown. Everyone but the storyteller votes for the one they think was the storyteller's.</li>
+          <li>
+            Guess right and you both score — but if <i>everyone</i> guesses right, or <i>no one</i> does, only
+            the guessers score. Fool someone with your own card and you pick up a point too.
+          </li>
+        </ol>
+        <p style={{ fontSize: 12, color: C.muted, marginTop: 16, lineHeight: 1.6 }}>
+          Updates arrive live — no need to tap twice. The ⏱ next to "still choosing" is a soft nudge, not a
+          countdown that locks anyone out.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function Row({ label, children }) {
+  return (
+    <div>
+      {label && <div style={{ fontSize: 11, letterSpacing: 2, color: C.muted, marginBottom: 10 }}>{label.toUpperCase()}</div>}
+      <div style={{ display: "flex", gap: 12, overflowX: "auto", paddingBottom: 10, flexWrap: "wrap" }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Waiting({ names, verb, secsLeft }) {
+  if (!names.length) return null;
+  return (
+    <p style={{ color: C.muted, fontSize: 13, marginTop: 18 }}>
+      {names.join(", ")} {verb}
+      {typeof secsLeft === "number" ? (
+        <span style={{ marginLeft: 8, opacity: 0.8 }}>
+          {secsLeft > 0 ? `⏱ ${secsLeft}s` : "· taking their time…"}
+        </span>
+      ) : (
+        "…"
+      )}
+    </p>
+  );
+}
+
+const inp = {
+  width: "100%",
+  boxSizing: "border-box",
+  marginTop: 6,
+  padding: "12px 14px",
+  borderRadius: 10,
+  border: `1px solid ${C.muted}44`,
+  background: "#0B1A20",
+  color: C.bone,
+  fontSize: 15,
+  fontFamily: "Inter, system-ui, sans-serif",
+  outline: "none",
+};
+
+export default function App() {
+  useFonts();
+  const deviceId = useRef(getDeviceId()).current;
+  const [me, setMe] = useState(null);
+  const [code, setCode] = useState("");
+  const [core, setCore] = useState(null);
+  const [screen, setScreen] = useState("home");
+  const [nameIn, setNameIn] = useState("");
+  const [codeIn, setCodeIn] = useState("");
+  const [clueIn, setClueIn] = useState("");
+  const [sel, setSel] = useState(null);
+  const [deckIn, setDeckIn] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [restoring, setRestoring] = useState(true);
+  const [showHelp, setShowHelp] = useState(false);
+  const [nowTick, setNowTick] = useState(Date.now());
+  const phaseStartRef = useRef(Date.now());
+  const codeRef = useRef("");
+  codeRef.current = code;
+
+  useEffect(() => {
+    phaseStartRef.current = Date.now();
+  }, [core?.phase, core?.round]);
+  useEffect(() => {
+    const h = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(h);
+  }, []);
+  const secsLeft = Math.max(0, PHASE_TIMER_S - Math.floor((nowTick - phaseStartRef.current) / 1000));
+
+  useEffect(() => {
+    setSel(null);
+  }, [core?.phase, core?.round]);
+
+  /* ---- rejoin on load ---- */
+  useEffect(() => {
+    (async () => {
+      const seat = loadSeat();
+      if (seat?.code && seat?.id) {
+        const { data } = await supabase.from("rooms").select("*").eq("code", seat.code).single();
+        if (data) {
+          const state = rowToState(data);
+          if (state.players.some((p) => p.id === seat.id)) {
+            setMe({ id: seat.id, name: seat.name });
+            setCode(seat.code);
+            setCore(state);
+            setScreen("room");
+          }
+        }
+      }
+      setRestoring(false);
+    })();
+  }, []);
+
+  /* ---- realtime subscription + light fallback poll ---- */
+  useEffect(() => {
+    if (!code) return;
+    const channel = supabase
+      .channel(`room-${code}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "rooms", filter: `code=eq.${code}` },
+        (payload) => {
+          if (payload.new) setCore(rowToState(payload.new));
+        }
+      )
+      .subscribe();
+
+    const poll = setInterval(async () => {
+      const { data } = await supabase.from("rooms").select("*").eq("code", code).single();
+      if (data) setCore(rowToState(data));
+    }, FALLBACK_POLL_MS);
+
+    return () => {
+      supabase.removeChannel(channel);
+      clearInterval(poll);
+    };
+  }, [code]);
+
+  const leave = async () => {
+    if (me && code) {
+      await withRoom(code, (s) => applyAction(s, me.id, { type: "leave" }));
+    }
+    clearSeat();
+    setMe(null);
+    setCode("");
+    setCore(null);
+    setScreen("home");
+  };
+
+  /* ---- lobby actions ---- */
+  const createRoom = async () => {
+    if (!nameIn.trim()) return setErr("Enter a name first.");
+    setBusy(true);
+    setErr("");
+    const player = { id: deviceId, name: nameIn.trim().slice(0, 16) };
+    const urls = deckIn
+      .split(/\s+/)
+      .map((s) => s.trim())
+      .filter((s) => /^https?:\/\//.test(s));
+
+    for (let i = 0; i < 4; i++) {
+      const c = code4();
+      const state = freshCore(c, player, urls);
+      const { data, error } = await supabase.from("rooms").insert(stateToRow(state)).select().single();
+      if (!error && data) {
+        saveSeat(c, player);
+        setMe(player);
+        setCode(c);
+        setCore(rowToState(data));
+        setScreen("room");
+        setBusy(false);
+        return;
+      }
+      if (error && error.code !== "23505") break; // anything but "code already taken" — stop retrying
+    }
+    setBusy(false);
+    setErr("Couldn't create a room — check your connection and Supabase setup.");
+  };
+
+  const joinRoom = async () => {
+    if (!nameIn.trim()) return setErr("Enter a name first.");
+    const c = codeIn.trim().toUpperCase();
+    if (c.length !== 4) return setErr("Room codes are 4 letters.");
+    setBusy(true);
+    setErr("");
+    const player = { id: deviceId, name: nameIn.trim().slice(0, 16) };
+    const result = await withRoom(c, (s) => applyAction(s, player.id, { type: "join", name: player.name }));
+    setBusy(false);
+    if (!result.ok) {
+      return setErr(result.reason === "not-found" ? `No room named ${c}. Check the code with the host.` : "Couldn't join — try again.");
+    }
+    saveSeat(c, player);
+    setMe(player);
+    setCode(c);
+    setCore(result.state);
+    setScreen("room");
+  };
+
+  const start = async () => {
+    setErr("");
+    const result = await withRoom(code, (s) => applyAction(s, me.id, { type: "start" }));
+    if (!result.ok && result.state) {
+      const need = result.state.players.length * HAND_SIZE + 4;
+      setErr(`Deck too small: need at least ${need} cards.`);
+    } else if (result.ok) {
+      setCore(result.state);
+    }
+  };
+
+  const act = (type, extra = {}) =>
+    withRoom(code, (s) => applyAction(s, me.id, { type, round: s.round, phase: s.phase, ...extra })).then(
+      (r) => r.ok && setCore(r.state)
+    );
+
+  /* ---- derived ---- */
+  const isHost = core && me && core.hostId === me.id;
+  const st = core?.players?.[core.storytellerIdx];
+  const iAmSt = st && me && st.id === me.id;
+  const myHand = core?.hands?.[me?.id] || [];
+  const urlFor = (i) => core?.deckUrls?.[i] || null;
+
+  const page = {
+    minHeight: "100vh",
+    background: `radial-gradient(1200px 600px at 50% -10%, ${C.night3} 0%, ${C.night} 60%)`,
+    color: C.bone,
+    fontFamily: "Inter, system-ui, sans-serif",
+    padding: "20px 16px 48px",
+    boxSizing: "border-box",
+  };
+  const display = { fontFamily: "Fraunces, Georgia, serif", fontWeight: 600, letterSpacing: "-0.02em" };
+
+  if (restoring) {
+    return (
+      <div style={page}>
+        <p style={{ textAlign: "center", marginTop: 80, color: C.muted }}>Finding your seat…</p>
+      </div>
+    );
+  }
+
+  /* ---------- HOME ---------- */
+  if (screen === "home") {
+    return (
+      <div style={page}>
+        <style>{`input::placeholder,textarea::placeholder{color:${C.muted}}`}</style>
+        <div style={{ maxWidth: 460, margin: "0 auto" }}>
+          <div style={{ textAlign: "center", padding: "36px 0 28px" }}>
+            <div style={{ width: 92, margin: "0 auto 18px" }}>
+              <CardBack />
+            </div>
+            <h1 style={{ ...display, fontSize: 52, margin: 0, lineHeight: 1 }}>Fabel</h1>
+            <p style={{ color: C.muted, marginTop: 10, fontSize: 14 }}>
+              Give a clue. Hide your card. Guess the teller.
+            </p>
+          </div>
+
+          <label style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>YOUR NAME</label>
+          <input value={nameIn} onChange={(e) => setNameIn(e.target.value)} placeholder="Bes" style={inp} />
+
+          <div style={{ marginTop: 26 }}>
+            <label style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>JOIN A ROOM</label>
+            <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+              <input
+                value={codeIn}
+                onChange={(e) => setCodeIn(e.target.value.toUpperCase())}
+                placeholder="ABCD"
+                maxLength={4}
+                style={{ ...inp, marginTop: 0, letterSpacing: 6, textAlign: "center", fontWeight: 600 }}
+              />
+              <Btn onClick={joinRoom} disabled={busy}>
+                Join
+              </Btn>
+            </div>
+          </div>
+
+          <div style={{ margin: "30px 0 18px", display: "flex", alignItems: "center", gap: 12, color: C.muted, fontSize: 12 }}>
+            <div style={{ flex: 1, height: 1, background: `${C.muted}33` }} />
+            OR
+            <div style={{ flex: 1, height: 1, background: `${C.muted}33` }} />
+          </div>
+
+          <label style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>
+            CARD IMAGES (optional — one URL per line)
+          </label>
+          <textarea
+            value={deckIn}
+            onChange={(e) => setDeckIn(e.target.value)}
+            rows={3}
+            placeholder="Leave empty to use the built-in painted deck"
+            style={{ ...inp, resize: "vertical", fontSize: 12 }}
+          />
+          <div style={{ marginTop: 14 }}>
+            <Btn onClick={createRoom} disabled={busy}>
+              Create a room
+            </Btn>
+          </div>
+
+          {err && <p style={{ color: C.amber, fontSize: 13, marginTop: 14 }}>{err}</p>}
+        </div>
+      </div>
+    );
+  }
+
+  if (!core) return <div style={page}>Loading room…</div>;
+
+  /* ---------- LOBBY ---------- */
+  if (core.phase === "lobby") {
+    return (
+      <div style={page}>
+        <div style={{ maxWidth: 520, margin: "0 auto" }}>
+          <Header code={core.code} display={display} onLeave={leave} onHelp={() => setShowHelp(true)} />
+          {showHelp && <HelpPanel display={display} onClose={() => setShowHelp(false)} />}
+          <p style={{ color: C.muted, fontSize: 14, marginTop: 18 }}>
+            Share the code <b style={{ color: C.bone, letterSpacing: 3 }}>{core.code}</b> — everyone opens
+            this same link and taps Join.
+          </p>
+          <h2 style={{ ...display, fontSize: 22, marginTop: 28 }}>At the table ({core.players.length})</h2>
+          <ul style={{ listStyle: "none", padding: 0, margin: "10px 0 0" }}>
+            {core.players.map((p) => (
+              <li
+                key={p.id}
+                style={{
+                  padding: "12px 14px",
+                  background: `${C.night2}cc`,
+                  borderRadius: 10,
+                  marginBottom: 8,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  fontSize: 15,
+                }}
+              >
+                <span>
+                  {p.name} {p.id === me.id && <span style={{ color: C.muted }}>(you)</span>}
+                </span>
+                {p.id === core.hostId && <span style={{ color: C.amber, fontSize: 12 }}>host</span>}
+              </li>
+            ))}
+          </ul>
+          <p style={{ color: C.muted, fontSize: 13, marginTop: 18 }}>
+            Deck: {core.deckUrls.length ? `${core.deckUrls.length} of your images` : "84 painted placeholders"}
+          </p>
+          {isHost ? (
+            <div style={{ marginTop: 22 }}>
+              <Btn onClick={start} disabled={core.players.length < 3}>
+                {core.players.length < 3 ? "Waiting for 3+ players" : "Deal the first hand"}
+              </Btn>
+            </div>
+          ) : (
+            <p style={{ color: C.muted, marginTop: 22, fontSize: 14 }}>Waiting for the host to deal…</p>
+          )}
+          {err && <p style={{ color: C.amber, fontSize: 13, marginTop: 14 }}>{err}</p>}
+        </div>
+      </div>
+    );
+  }
+
+  /* ---------- END ---------- */
+  if (core.phase === "end") {
+    const ranked = [...core.players].sort((a, b) => b.score - a.score);
+    return (
+      <div style={page}>
+        <div style={{ maxWidth: 460, margin: "0 auto", textAlign: "center" }}>
+          <h1 style={{ ...display, fontSize: 40, marginTop: 40 }}>{ranked[0].name} wins</h1>
+          <ul style={{ listStyle: "none", padding: 0, marginTop: 24 }}>
+            {ranked.map((p, i) => (
+              <li key={p.id} style={{ padding: "10px 0", borderBottom: `1px solid ${C.muted}22`, fontSize: 16 }}>
+                <span style={{ color: C.muted, marginRight: 10 }}>{i + 1}</span>
+                {p.name} <b style={{ float: "right", color: C.amber }}>{p.score}</b>
+              </li>
+            ))}
+          </ul>
+          {isHost && (
+            <div style={{ marginTop: 30 }}>
+              <Btn onClick={() => act("restart")}>Play again</Btn>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  /* ---------- GAME ---------- */
+  const phaseLine = () => {
+    if (core.phase === "clue") return iAmSt ? "Your turn to tell" : `${st.name} is choosing a card`;
+    if (core.phase === "submit") return iAmSt ? "Waiting for the others" : "Pick a card that fits the clue";
+    if (core.phase === "vote") return iAmSt ? "They're voting" : "Which one is the teller's?";
+    return "Round over";
+  };
+
+  const iSubmitted = core.submissions.some((s) => s.playerId === me.id);
+  const iVoted = core.votes[me.id] !== undefined;
+
+  return (
+    <div style={page}>
+      <div style={{ maxWidth: 900, margin: "0 auto" }}>
+        <Header code={core.code} display={display} round={core.round} onLeave={leave} onHelp={() => setShowHelp(true)} />
+        {showHelp && <HelpPanel display={display} onClose={() => setShowHelp(false)} />}
+
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 14 }}>
+          {core.players.map((p) => (
+            <div
+              key={p.id}
+              style={{
+                padding: "6px 12px",
+                borderRadius: 999,
+                fontSize: 13,
+                background: p.id === st.id ? `${C.violet}33` : `${C.night2}`,
+                boxShadow: p.id === st.id ? `inset 0 0 0 1px ${C.violet}88` : "none",
+              }}
+            >
+              {p.id === st.id && "✦ "}
+              {p.name} <b style={{ color: C.amber, marginLeft: 4 }}>{p.score}</b>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ textAlign: "center", padding: "34px 10px 26px" }}>
+          <div style={{ fontSize: 11, letterSpacing: 2, color: C.muted, marginBottom: 10 }}>
+            {phaseLine().toUpperCase()}
+          </div>
+          {core.clue ? (
+            <div style={{ ...display, fontSize: "clamp(26px,6vw,46px)", lineHeight: 1.15, color: C.bone }}>
+              <span style={{ color: C.amber, opacity: 0.6 }}>“</span>
+              {core.clue}
+              <span style={{ color: C.amber, opacity: 0.6 }}>”</span>
+            </div>
+          ) : (
+            <div style={{ ...display, fontSize: 26, color: C.muted }}>…</div>
+          )}
+        </div>
+
+        {core.phase === "clue" && iAmSt && (
+          <>
+            <Row label="Choose one card, then write your clue">
+              {myHand.map((c) => (
+                <Card key={c} seed={c} url={urlFor(c)} selected={sel === c} onClick={() => setSel(c)} />
+              ))}
+            </Row>
+            <div style={{ display: "flex", gap: 8, marginTop: 18, flexWrap: "wrap" }}>
+              <input
+                value={clueIn}
+                onChange={(e) => setClueIn(e.target.value)}
+                placeholder="a word, a phrase, a sound…"
+                style={{ ...inp, marginTop: 0, flex: "1 1 240px" }}
+              />
+              <Btn
+                disabled={sel === null || !clueIn.trim()}
+                onClick={() => {
+                  act("clue", { card: sel, clue: clueIn.trim() });
+                  setClueIn("");
+                }}
+              >
+                Tell it
+              </Btn>
+            </div>
+          </>
+        )}
+        {core.phase === "clue" && !iAmSt && (
+          <Row label="Your hand">
+            {myHand.map((c) => (
+              <Card key={c} seed={c} url={urlFor(c)} />
+            ))}
+          </Row>
+        )}
+
+        {core.phase === "submit" && (
+          <>
+            {!iAmSt && !iSubmitted && (
+              <>
+                <Row label="Your hand">
+                  {myHand.map((c) => (
+                    <Card key={c} seed={c} url={urlFor(c)} selected={sel === c} onClick={() => setSel(c)} />
+                  ))}
+                </Row>
+                <div style={{ marginTop: 18 }}>
+                  <Btn disabled={sel === null} onClick={() => act("submit", { card: sel })}>
+                    Play this card face down
+                  </Btn>
+                </div>
+              </>
+            )}
+            <Waiting
+              names={core.players.filter((p) => !core.submissions.some((s) => s.playerId === p.id)).map((p) => p.name)}
+              verb="still choosing"
+              secsLeft={secsLeft}
+            />
+          </>
+        )}
+
+        {core.phase === "vote" && (
+          <>
+            <Row label="On the table">
+              {core.submissions.map((s) => {
+                const mine = s.playerId === me.id;
+                return (
+                  <Card
+                    key={s.card}
+                    seed={s.card}
+                    url={urlFor(s.card)}
+                    width={150}
+                    dim={mine && !iAmSt}
+                    selected={sel === s.card}
+                    badge={mine ? "yours" : undefined}
+                    onClick={!iAmSt && !iVoted && !mine ? () => setSel(s.card) : undefined}
+                  />
+                );
+              })}
+            </Row>
+            {!iAmSt && !iVoted && (
+              <div style={{ marginTop: 18 }}>
+                <Btn disabled={sel === null} onClick={() => act("vote", { card: sel })}>
+                  Vote for this one
+                </Btn>
+              </div>
+            )}
+            <Waiting
+              names={core.players.filter((p) => p.id !== st.id && core.votes[p.id] === undefined).map((p) => p.name)}
+              verb="still voting"
+              secsLeft={secsLeft}
+            />
+          </>
+        )}
+
+        {core.phase === "reveal" && core.result && (
+          <>
+            <Row label="">
+              {core.submissions.map((s) => {
+                const owner = core.players.find((p) => p.id === s.playerId);
+                const voters = Object.entries(core.votes)
+                  .filter(([, c]) => c === s.card)
+                  .map(([vid]) => core.players.find((p) => p.id === vid)?.name)
+                  .filter(Boolean);
+                const isSt = s.card === core.result.stCard;
+                return (
+                  <div key={s.card} style={{ flex: "0 0 auto" }}>
+                    <div style={{ outline: isSt ? `3px solid ${C.violet}` : "none", borderRadius: 12 }}>
+                      <Card seed={s.card} url={urlFor(s.card)} width={150} />
+                    </div>
+                    <div style={{ width: 150, marginTop: 8, fontSize: 12, lineHeight: 1.5 }}>
+                      <div style={{ color: isSt ? C.violet : C.bone, fontWeight: 600 }}>
+                        {owner?.name}
+                        {isSt && " ✦"}
+                      </div>
+                      <div style={{ color: C.muted }}>{voters.length ? `voted by ${voters.join(", ")}` : "no votes"}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </Row>
+            <div style={{ marginTop: 24, fontSize: 14, color: C.muted }}>
+              {core.result.allOrNone
+                ? `${st.name}'s clue was ${core.result.correctIds.length ? "too easy" : "too hard"} — no points for the teller.`
+                : `${st.name} scores. Correct guesses: ${
+                    core.result.correctIds.map((i) => core.players.find((p) => p.id === i)?.name).join(", ") || "none"
+                  }.`}
+            </div>
+            <div style={{ marginTop: 12, display: "flex", flexWrap: "wrap", gap: 10 }}>
+              {core.players.map((p) => (
+                <span key={p.id} style={{ fontSize: 13 }}>
+                  {p.name} <b style={{ color: core.result.gains[p.id] ? C.green : C.muted }}>+{core.result.gains[p.id]}</b>
+                </span>
+              ))}
+            </div>
+            {isHost && (
+              <div style={{ marginTop: 24 }}>
+                <Btn onClick={() => act("next")}>Next round</Btn>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
