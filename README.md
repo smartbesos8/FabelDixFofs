@@ -33,7 +33,7 @@ Any further push to `main` redeploys automatically.
 
 ## 4. Adding the real card deck
 
-Once you've generated and culled images (see `deck-kit.md` from earlier), drop them in a `/cards` folder in this same repo, named `card-01.jpg` … `card-84.jpg`. They'll be served at:
+Once you've generated and culled images (see `deck-kit.md` from earlier), drop them in the `public/cards/` folder in this repo, named `card-01.jpg` … `card-84.jpg`. They have to live under `public/` — that's the one folder Vite copies into the deployed build as-is; anything at the repo root outside it gets left behind at build time. They'll be served at:
 
 ```
 https://<username>.github.io/<repo>/cards/card-01.jpg
