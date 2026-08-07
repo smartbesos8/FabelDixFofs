@@ -39,10 +39,13 @@ Once you've generated and culled images (see `deck-kit.md` from earlier), drop t
 https://<username>.github.io/<repo>/cards/card-01.jpg
 ```
 
-Paste that full list of URLs (one per line) into the "card images" box on the home screen when creating a room.
+On the home screen, click **"USE /cards FOLDER"** next to the card images box — it fills in all 84 URLs for you, resolved from wherever the site is actually hosted (works the same on localhost and on GitHub Pages). Any card that fails to load falls back to the painted placeholder for that slot, so a partial deck never shows a broken image. Once you create a room with a deck, it's remembered in your browser for next time.
+
+You don't have to use exactly 84 — pass a different card count to `autofillDeck()` in `src/App.jsx` (search `USE /cards FOLDER`) if your deck is a different size, or just paste your own list of URLs (one per line) into the box directly.
 
 ## Notes
 
 - **Trust model:** anyone who knows the 4-letter room code can read and write that room's data (see the comment in `schema.sql`). That matches the earlier prototype — fine for a private family game shared over WhatsApp, not a substitute for real per-player authentication.
 - **Free tier:** Supabase pauses a project after 7 days with no activity — it comes back automatically the next time someone opens the app, just with a few seconds' delay on that first load. GitHub Pages has no such pause.
+- **Sound:** a soft chime on reveal and a small flourish on the win screen, both synthesized in-browser (no audio files to host). Toggle with the 🔊 next to the room code — the choice is remembered per-device.
 - Game rules and scoring live in `src/App.jsx`, in the same handful of functions as before (`startGame`, `tally`, `nextRound`, `applyAction`) — tell me what to change and I'll edit them directly.

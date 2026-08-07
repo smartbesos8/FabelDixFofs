@@ -93,13 +93,17 @@ const SILHOUETTES = [
 ];
 
 function CardArt({ seed, url }) {
-  if (url) {
+  const [broken, setBroken] = useState(false);
+  useEffect(() => setBroken(false), [url]);
+  if (url && !broken) {
     return (
       <img
         src={url}
         alt=""
+        loading="lazy"
         style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
         draggable={false}
+        onError={() => setBroken(true)}
       />
     );
   }
@@ -405,6 +409,158 @@ function useFonts() {
   }, []);
 }
 
+/* Global keyframes + a few small resets — injected once, kept out of every
+   inline style object. Respects prefers-reduced-motion throughout. */
+function useGlobalStyles() {
+  useEffect(() => {
+    const s = document.createElement("style");
+    s.textContent = `
+      html, body, #root { max-width: 100%; overflow-x: hidden; }
+      * { -webkit-tap-highlight-color: transparent; }
+      @keyframes fabelFade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+      .fabel-fade { animation: fabelFade .38s ease; }
+      @keyframes fabelPulse { 0%, 100% { box-shadow: 0 0 0 0 ${C.violet}55; } 50% { box-shadow: 0 0 0 8px ${C.violet}00; } }
+      .fabel-pulse { animation: fabelPulse 1.8s ease-in-out infinite; }
+      @media (prefers-reduced-motion: reduce) {
+        .fabel-fade { animation: none !important; }
+        .fabel-pulse { animation: none !important; }
+        * { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+      }
+    `;
+    document.head.appendChild(s);
+    return () => {
+      try {
+        document.head.removeChild(s);
+      } catch {}
+    };
+  }, []);
+}
+
+/* ---------- optional sound: a couple of soft synth chimes, no assets ---------- */
+function useSound() {
+  const [enabled, setEnabled] = useState(() => {
+    try {
+      return localStorage.getItem("fabel:sound") !== "off";
+    } catch {
+      return true;
+    }
+  });
+  const ctxRef = useRef(null);
+
+  const ensureCtx = useCallback(() => {
+    if (!enabled) return null;
+    if (!ctxRef.current) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      try {
+        ctxRef.current = new AC();
+      } catch {
+        return null;
+      }
+    }
+    if (ctxRef.current.state === "suspended") ctxRef.current.resume().catch(() => {});
+    return ctxRef.current;
+  }, [enabled]);
+
+  const tone = useCallback(
+    (freq, start, dur, gain = 0.045, type = "sine") => {
+      const ctx = ensureCtx();
+      if (!ctx) return;
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = type;
+      osc.frequency.value = freq;
+      g.gain.value = 0;
+      osc.connect(g);
+      g.connect(ctx.destination);
+      const t0 = ctx.currentTime + start;
+      g.gain.linearRampToValueAtTime(gain, t0 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.05);
+    },
+    [ensureCtx]
+  );
+
+  const chime = useCallback(() => {
+    tone(880, 0, 0.5);
+    tone(1318.5, 0.09, 0.55, 0.035);
+  }, [tone]);
+
+  const flourish = useCallback(() => {
+    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.1, 0.55, 0.04));
+  }, [tone]);
+
+  const toggle = useCallback(() => {
+    setEnabled((e) => {
+      const next = !e;
+      try {
+        localStorage.setItem("fabel:sound", next ? "on" : "off");
+      } catch {}
+      return next;
+    });
+  }, []);
+
+  return { enabled, toggle, chime, flourish, unlock: ensureCtx };
+}
+
+/* ---------- a light canvas confetti burst for the win screen ---------- */
+function useConfetti(active) {
+  const canvasRef = useRef(null);
+  useEffect(() => {
+    if (!active) return;
+    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const canvas = canvasRef.current;
+    if (!canvas || reduce) return;
+    const ctx = canvas.getContext("2d");
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const resize = () => {
+      canvas.width = window.innerWidth * dpr;
+      canvas.height = window.innerHeight * dpr;
+      canvas.style.width = window.innerWidth + "px";
+      canvas.style.height = window.innerHeight + "px";
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    };
+    resize();
+    window.addEventListener("resize", resize);
+    const colors = [C.amber, C.violet, C.green, C.bone];
+    const parts = Array.from({ length: 130 }, () => ({
+      x: Math.random() * window.innerWidth,
+      y: -20 - Math.random() * window.innerHeight * 0.6,
+      r: 3 + Math.random() * 4,
+      c: colors[Math.floor(Math.random() * colors.length)],
+      vy: 2 + Math.random() * 2.6,
+      vx: -1.4 + Math.random() * 2.8,
+      rot: Math.random() * Math.PI,
+      vr: -0.22 + Math.random() * 0.44,
+    }));
+    let raf;
+    const startTime = performance.now();
+    const tick = (t) => {
+      ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+      parts.forEach((p) => {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.rot += p.vr;
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.rot);
+        ctx.fillStyle = p.c;
+        ctx.fillRect(-p.r, -p.r * 0.6, p.r * 2, p.r * 1.2);
+        ctx.restore();
+      });
+      if (t - startTime < 2600) raf = requestAnimationFrame(tick);
+      else ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("resize", resize);
+    };
+  }, [active]);
+  return canvasRef;
+}
+
 const Btn = ({ children, onClick, disabled, tone = "amber", small }) => (
   <button
     onClick={onClick}
@@ -414,6 +570,7 @@ const Btn = ({ children, onClick, disabled, tone = "amber", small }) => (
       fontWeight: 600,
       fontSize: small ? 13 : 15,
       padding: small ? "8px 14px" : "12px 22px",
+      minHeight: small ? 34 : 44,
       borderRadius: 999,
       border: "none",
       cursor: disabled ? "not-allowed" : "pointer",
@@ -422,6 +579,7 @@ const Btn = ({ children, onClick, disabled, tone = "amber", small }) => (
       color: tone === "amber" ? C.night : C.bone,
       boxShadow: tone === "ghost" ? `inset 0 0 0 1px ${C.muted}66` : "none",
       transition: "transform .12s ease, opacity .12s ease",
+      touchAction: "manipulation",
     }}
     onMouseDown={(e) => (e.currentTarget.style.transform = "scale(.97)")}
     onMouseUp={(e) => (e.currentTarget.style.transform = "scale(1)")}
@@ -431,7 +589,64 @@ const Btn = ({ children, onClick, disabled, tone = "amber", small }) => (
   </button>
 );
 
-function Card({ seed, url, selected, dim, onClick, badge, width = 132 }) {
+const HAND_CARD_W = "clamp(92px, 26vw, 132px)";
+const TABLE_CARD_W = "clamp(108px, 32vw, 150px)";
+
+/* `flip` makes the card mount face-down and turn face-up a beat later —
+   used when cards land on the table so the reveal reads as a reveal. */
+function Card({ seed, url, selected, dim, onClick, badge, width = HAND_CARD_W, flip, flipDelay = 0 }) {
+  const [revealed, setRevealed] = useState(!flip);
+  useEffect(() => {
+    if (!flip) return;
+    setRevealed(false);
+    const t = setTimeout(() => setRevealed(true), 90 + flipDelay);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flip, flipDelay, seed]);
+
+  const face = (hidden) => (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        borderRadius: 10,
+        overflow: "hidden",
+        backfaceVisibility: flip ? "hidden" : undefined,
+        transform: hidden ? "rotateY(180deg)" : "none",
+        outline: !hidden && selected ? `3px solid ${C.amber}` : !hidden ? `1px solid ${C.muted}44` : "none",
+        outlineOffset: !hidden && selected ? 2 : 0,
+        opacity: !hidden && dim ? 0.42 : 1,
+        background: C.night2,
+      }}
+    >
+      {hidden ? (
+        <CardBack />
+      ) : (
+        <>
+          <CardArt seed={seed} url={url} />
+          {badge && (
+            <div
+              style={{
+                position: "absolute",
+                left: 0,
+                right: 0,
+                bottom: 0,
+                padding: "6px 8px",
+                fontSize: 11,
+                fontFamily: "Inter, sans-serif",
+                fontWeight: 600,
+                color: C.bone,
+                background: "linear-gradient(transparent, rgba(0,0,0,.85))",
+              }}
+            >
+              {badge}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+
   return (
     <div
       onClick={onClick}
@@ -442,37 +657,25 @@ function Card({ seed, url, selected, dim, onClick, badge, width = 132 }) {
         position: "relative",
         width,
         aspectRatio: "5 / 7",
-        borderRadius: 10,
-        overflow: "hidden",
         cursor: onClick ? "pointer" : "default",
-        outline: selected ? `3px solid ${C.amber}` : `1px solid ${C.muted}44`,
-        outlineOffset: selected ? 2 : 0,
-        opacity: dim ? 0.42 : 1,
-        transform: selected ? "translateY(-6px)" : "none",
-        transition: "transform .16s ease, opacity .16s ease",
         flex: "0 0 auto",
-        background: C.night2,
+        touchAction: "manipulation",
+        perspective: flip ? 900 : undefined,
       }}
     >
-      <CardArt seed={seed} url={url} />
-      {badge && (
-        <div
-          style={{
-            position: "absolute",
-            left: 0,
-            right: 0,
-            bottom: 0,
-            padding: "6px 8px",
-            fontSize: 11,
-            fontFamily: "Inter, sans-serif",
-            fontWeight: 600,
-            color: C.bone,
-            background: "linear-gradient(transparent, rgba(0,0,0,.85))",
-          }}
-        >
-          {badge}
-        </div>
-      )}
+      <div
+        style={{
+          position: "relative",
+          width: "100%",
+          height: "100%",
+          transformStyle: flip ? "preserve-3d" : undefined,
+          transition: flip ? "transform .55s cubic-bezier(.3,.15,.15,1)" : "transform .16s ease",
+          transform: flip ? (revealed ? "rotateY(0deg)" : "rotateY(180deg)") : selected ? "translateY(-6px)" : "none",
+        }}
+      >
+        {face(false)}
+        {flip && face(true)}
+      </div>
     </div>
   );
 }
@@ -488,13 +691,22 @@ const linkBtnStyle = {
   textDecoration: "underline",
 };
 
-function Header({ code, display, round, onLeave, onHelp }) {
+function Header({ code, display, round, onLeave, onHelp, soundOn, onToggleSound }) {
   return (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
       <span style={{ ...display, fontSize: 24 }}>Fabel</span>
-      <span style={{ fontSize: 12, color: C.muted, letterSpacing: 2 }}>
+      <span style={{ fontSize: 12, color: C.muted, letterSpacing: 2, display: "inline-flex", alignItems: "baseline" }}>
         {round ? `ROUND ${round} · ` : ""}
         {code}
+        {onToggleSound && (
+          <button
+            onClick={onToggleSound}
+            title={soundOn ? "Mute sound" : "Unmute sound"}
+            style={{ ...linkBtnStyle, textDecoration: "none", fontSize: 14 }}
+          >
+            {soundOn ? "🔊" : "🔇"}
+          </button>
+        )}
         {onHelp && (
           <button onClick={onHelp} style={linkBtnStyle}>
             RULES
@@ -599,13 +811,15 @@ const inp = {
   border: `1px solid ${C.muted}44`,
   background: "#0B1A20",
   color: C.bone,
-  fontSize: 15,
+  fontSize: 16, // 16px keeps iOS Safari from auto-zooming in on focus
   fontFamily: "Inter, system-ui, sans-serif",
   outline: "none",
 };
 
 export default function App() {
   useFonts();
+  useGlobalStyles();
+  const sound = useSound();
   const deviceId = useRef(getDeviceId()).current;
   const [me, setMe] = useState(null);
   const [code, setCode] = useState("");
@@ -615,7 +829,13 @@ export default function App() {
   const [codeIn, setCodeIn] = useState("");
   const [clueIn, setClueIn] = useState("");
   const [sel, setSel] = useState(null);
-  const [deckIn, setDeckIn] = useState("");
+  const [deckIn, setDeckIn] = useState(() => {
+    try {
+      return localStorage.getItem("fabel:deck") || "";
+    } catch {
+      return "";
+    }
+  });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [restoring, setRestoring] = useState(true);
@@ -624,6 +844,19 @@ export default function App() {
   const phaseStartRef = useRef(Date.now());
   const codeRef = useRef("");
   codeRef.current = code;
+  const confettiRef = useConfetti(core?.phase === "end");
+  const prevPhaseRef = useRef(null);
+
+  /* ---- a soft chime on reveal, a small flourish on the win screen ---- */
+  useEffect(() => {
+    const phase = core?.phase;
+    const prev = prevPhaseRef.current;
+    if (phase && prev && phase !== prev) {
+      if (phase === "reveal") sound.chime();
+      if (phase === "end") sound.flourish();
+    }
+    prevPhaseRef.current = phase || null;
+  }, [core?.phase, sound]);
 
   useEffect(() => {
     phaseStartRef.current = Date.now();
@@ -711,6 +944,10 @@ export default function App() {
       const { data, error } = await supabase.from("rooms").insert(stateToRow(state)).select().single();
       if (!error && data) {
         saveSeat(c, player);
+        try {
+          if (urls.length) localStorage.setItem("fabel:deck", deckIn);
+          else localStorage.removeItem("fabel:deck");
+        } catch {}
         setMe(player);
         setCode(c);
         setCore(rowToState(data));
@@ -722,6 +959,23 @@ export default function App() {
     }
     setBusy(false);
     setErr("Couldn't create a room — check your connection and Supabase setup.");
+  };
+
+  /* Fills the deck box with card-01.jpg … card-NN.jpg, resolved relative to
+     wherever this page is actually hosted — works the same on localhost and
+     on a GitHub Pages subpath, no need to type your own repo URL. Normalizes
+     to a trailing-slash directory first so it can't resolve one level too
+     high if the page happened to load without one. */
+  const autofillDeck = (count = 84) => {
+    const here = new URL(window.location.href);
+    if (!here.pathname.endsWith("/")) {
+      here.pathname = here.pathname.slice(0, here.pathname.lastIndexOf("/") + 1);
+    }
+    const urls = Array.from(
+      { length: count },
+      (_, i) => new URL(`cards/card-${String(i + 1).padStart(2, "0")}.jpg`, here).href
+    );
+    setDeckIn(urls.join("\n"));
   };
 
   const joinRoom = async () => {
@@ -754,10 +1008,12 @@ export default function App() {
     }
   };
 
-  const act = (type, extra = {}) =>
-    withRoom(code, (s) => applyAction(s, me.id, { type, round: s.round, phase: s.phase, ...extra })).then(
+  const act = (type, extra = {}) => {
+    sound.unlock(); // first real click of a session — safe place to unlock audio autoplay
+    return withRoom(code, (s) => applyAction(s, me.id, { type, round: s.round, phase: s.phase, ...extra })).then(
       (r) => r.ok && setCore(r.state)
     );
+  };
 
   /* ---- derived ---- */
   const isHost = core && me && core.hostId === me.id;
@@ -771,7 +1027,7 @@ export default function App() {
     background: `radial-gradient(1200px 600px at 50% -10%, ${C.night3} 0%, ${C.night} 60%)`,
     color: C.bone,
     fontFamily: "Inter, system-ui, sans-serif",
-    padding: "20px 16px 48px",
+    padding: "20px max(16px, env(safe-area-inset-right)) max(48px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left))",
     boxSizing: "border-box",
   };
   const display = { fontFamily: "Fraunces, Georgia, serif", fontWeight: 600, letterSpacing: "-0.02em" };
@@ -825,9 +1081,14 @@ export default function App() {
             <div style={{ flex: 1, height: 1, background: `${C.muted}33` }} />
           </div>
 
-          <label style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>
-            CARD IMAGES (optional — one URL per line)
-          </label>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+            <label style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>
+              CARD IMAGES (optional — one URL per line)
+            </label>
+            <button onClick={() => autofillDeck(84)} style={{ ...linkBtnStyle, marginLeft: 0 }}>
+              USE /cards FOLDER
+            </button>
+          </div>
           <textarea
             value={deckIn}
             onChange={(e) => setDeckIn(e.target.value)}
@@ -835,6 +1096,10 @@ export default function App() {
             placeholder="Leave empty to use the built-in painted deck"
             style={{ ...inp, resize: "vertical", fontSize: 12 }}
           />
+          <p style={{ fontSize: 11, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>
+            "Use /cards folder" fills in card-01.jpg … card-84.jpg from this same site. Any card image that
+            fails to load just falls back to the painted placeholder for that card.
+          </p>
           <div style={{ marginTop: 14 }}>
             <Btn onClick={createRoom} disabled={busy}>
               Create a room
@@ -854,7 +1119,14 @@ export default function App() {
     return (
       <div style={page}>
         <div style={{ maxWidth: 520, margin: "0 auto" }}>
-          <Header code={core.code} display={display} onLeave={leave} onHelp={() => setShowHelp(true)} />
+          <Header
+            code={core.code}
+            display={display}
+            onLeave={leave}
+            onHelp={() => setShowHelp(true)}
+            soundOn={sound.enabled}
+            onToggleSound={sound.toggle}
+          />
           {showHelp && <HelpPanel display={display} onClose={() => setShowHelp(false)} />}
           <p style={{ color: C.muted, fontSize: 14, marginTop: 18 }}>
             Share the code <b style={{ color: C.bone, letterSpacing: 3 }}>{core.code}</b> — everyone opens
@@ -905,7 +1177,8 @@ export default function App() {
     const ranked = [...core.players].sort((a, b) => b.score - a.score);
     return (
       <div style={page}>
-        <div style={{ maxWidth: 460, margin: "0 auto", textAlign: "center" }}>
+        <canvas ref={confettiRef} style={{ position: "fixed", inset: 0, pointerEvents: "none", zIndex: 40 }} />
+        <div className="fabel-fade" style={{ maxWidth: 460, margin: "0 auto", textAlign: "center" }}>
           <h1 style={{ ...display, fontSize: 40, marginTop: 40 }}>{ranked[0].name} wins</h1>
           <ul style={{ listStyle: "none", padding: 0, marginTop: 24 }}>
             {ranked.map((p, i) => (
@@ -939,7 +1212,15 @@ export default function App() {
   return (
     <div style={page}>
       <div style={{ maxWidth: 900, margin: "0 auto" }}>
-        <Header code={core.code} display={display} round={core.round} onLeave={leave} onHelp={() => setShowHelp(true)} />
+        <Header
+          code={core.code}
+          display={display}
+          round={core.round}
+          onLeave={leave}
+          onHelp={() => setShowHelp(true)}
+          soundOn={sound.enabled}
+          onToggleSound={sound.toggle}
+        />
         {showHelp && <HelpPanel display={display} onClose={() => setShowHelp(false)} />}
 
         <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 14 }}>
@@ -975,6 +1256,7 @@ export default function App() {
           )}
         </div>
 
+        <div key={`${core.phase}-${core.round}`} className="fabel-fade">
         {core.phase === "clue" && iAmSt && (
           <>
             <Row label="Choose one card, then write your clue">
@@ -1036,14 +1318,16 @@ export default function App() {
         {core.phase === "vote" && (
           <>
             <Row label="On the table">
-              {core.submissions.map((s) => {
+              {core.submissions.map((s, i) => {
                 const mine = s.playerId === me.id;
                 return (
                   <Card
                     key={s.card}
                     seed={s.card}
                     url={urlFor(s.card)}
-                    width={150}
+                    width={TABLE_CARD_W}
+                    flip
+                    flipDelay={i * 90}
                     dim={mine && !iAmSt}
                     selected={sel === s.card}
                     badge={mine ? "yours" : undefined}
@@ -1070,7 +1354,7 @@ export default function App() {
         {core.phase === "reveal" && core.result && (
           <>
             <Row label="">
-              {core.submissions.map((s) => {
+              {core.submissions.map((s, i) => {
                 const owner = core.players.find((p) => p.id === s.playerId);
                 const voters = Object.entries(core.votes)
                   .filter(([, c]) => c === s.card)
@@ -1078,11 +1362,14 @@ export default function App() {
                   .filter(Boolean);
                 const isSt = s.card === core.result.stCard;
                 return (
-                  <div key={s.card} style={{ flex: "0 0 auto" }}>
-                    <div style={{ outline: isSt ? `3px solid ${C.violet}` : "none", borderRadius: 12 }}>
-                      <Card seed={s.card} url={urlFor(s.card)} width={150} />
+                  <div key={s.card} style={{ flex: "0 0 auto", width: TABLE_CARD_W }}>
+                    <div
+                      className={isSt ? "fabel-pulse" : undefined}
+                      style={{ outline: isSt ? `3px solid ${C.violet}` : "none", borderRadius: 12 }}
+                    >
+                      <Card seed={s.card} url={urlFor(s.card)} width="100%" flip flipDelay={i * 90} />
                     </div>
-                    <div style={{ width: 150, marginTop: 8, fontSize: 12, lineHeight: 1.5 }}>
+                    <div style={{ marginTop: 8, fontSize: 12, lineHeight: 1.5 }}>
                       <div style={{ color: isSt ? C.violet : C.bone, fontWeight: 600 }}>
                         {owner?.name}
                         {isSt && " ✦"}
@@ -1114,6 +1401,7 @@ export default function App() {
             )}
           </>
         )}
+        </div>
       </div>
     </div>
   );
