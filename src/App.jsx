@@ -951,7 +951,7 @@ export default function App() {
   });
   const [deckCount, setDeckCount] = useState(() => {
     try {
-      return Number(localStorage.getItem("fabel:deckCount")) || 84;
+      return Number(localStorage.getItem("fabel:deckCount")) || 89;
     } catch {
       return 84;
     }
