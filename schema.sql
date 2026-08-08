@@ -40,3 +40,22 @@ alter publication supabase_realtime add table rooms;
 -- Optional housekeeping: rooms older than 14 days are almost certainly
 -- abandoned test games. Safe to run occasionally by hand; not scheduled.
 -- delete from rooms where created_at < now() - interval '14 days';
+
+-- ---------------------------------------------------------------
+-- Voice clues — run this once too (same SQL Editor → New query → Run).
+-- Lets the storyteller record a short clip instead of typing a clue.
+-- ---------------------------------------------------------------
+
+-- Carries the recorded clip's URL alongside the existing text clue.
+alter table rooms add column if not exists clue_audio_url text;
+
+-- A public bucket for the clips themselves. Same trust model as the
+-- rooms table above — anyone with the link can play a clip, nobody
+-- needs to be logged in to record or listen. Capped at 5MB and to
+-- audio types only.
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('clue-audio', 'clue-audio', true, 5242880, array['audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg'])
+on conflict (id) do nothing;
+
+create policy "anyone can read clue audio" on storage.objects for select using (bucket_id = 'clue-audio');
+create policy "anyone can upload clue audio" on storage.objects for insert with check (bucket_id = 'clue-audio');

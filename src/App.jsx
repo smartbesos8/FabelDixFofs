@@ -176,6 +176,7 @@ function freshCore(code, host, deckUrls) {
     hands: {},
     storytellerIdx: 0,
     clue: "",
+    clueAudioUrl: null,
     storytellerCard: null,
     submissions: [],
     votes: {},
@@ -214,6 +215,7 @@ function startGame(core) {
   core.storytellerIdx = 0;
   core.phase = "clue";
   core.clue = "";
+  core.clueAudioUrl = null;
   core.storytellerCard = null;
   core.submissions = [];
   core.votes = {};
@@ -257,6 +259,7 @@ function nextRound(core) {
   core.storytellerIdx = (core.storytellerIdx + 1) % core.players.length;
   core.phase = "clue";
   core.clue = "";
+  core.clueAudioUrl = null;
   core.storytellerCard = null;
   core.submissions = [];
   core.votes = {};
@@ -294,7 +297,9 @@ function applyAction(core, pid, act) {
   if (act.round !== core.round || act.phase !== core.phase) return false;
 
   if (act.type === "clue" && pid === st.id) {
-    core.clue = act.clue.slice(0, 120);
+    if (!act.clue?.trim() && !act.clueAudioUrl) return false; // need a word or a voice clip
+    core.clue = (act.clue || "").slice(0, 120);
+    core.clueAudioUrl = act.clueAudioUrl || null;
     core.storytellerCard = act.card;
     core.hands[pid] = core.hands[pid].filter((c) => c !== act.card);
     core.submissions = [{ playerId: pid, card: act.card }];
@@ -336,6 +341,7 @@ function rowToState(row) {
     hands: row.hands || {},
     storytellerIdx: row.storyteller_idx,
     clue: row.clue || "",
+    clueAudioUrl: row.clue_audio_url || null,
     storytellerCard: row.storyteller_card,
     submissions: row.submissions || [],
     votes: row.votes || {},
@@ -357,6 +363,7 @@ function stateToRow(s) {
     hands: s.hands,
     storyteller_idx: s.storytellerIdx,
     clue: s.clue,
+    clue_audio_url: s.clueAudioUrl,
     storyteller_card: s.storytellerCard,
     submissions: s.submissions,
     votes: s.votes,
@@ -775,6 +782,112 @@ function HelpPanel({ onClose, display }) {
   );
 }
 
+/* Floating table chat — ephemeral (nothing persisted), relayed live over
+   Supabase Realtime broadcast. A round badge on the toggle shows unread
+   count while closed. */
+function ChatPanel({ open, onToggle, msgs, myDeviceId, chatIn, setChatIn, onSend, unread }) {
+  const listRef = useRef(null);
+  useEffect(() => {
+    if (open && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
+  }, [open, msgs.length]);
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        right: "max(16px, env(safe-area-inset-right))",
+        bottom: "max(16px, env(safe-area-inset-bottom))",
+        zIndex: 45,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "flex-end",
+      }}
+    >
+      {open && (
+        <div
+          style={{
+            width: "min(88vw, 300px)",
+            height: 360,
+            marginBottom: 10,
+            background: C.night2,
+            borderRadius: 14,
+            boxShadow: "0 20px 60px rgba(0,0,0,.5)",
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+          }}
+        >
+          <div style={{ padding: "10px 14px", fontSize: 11, letterSpacing: 2, color: C.muted, borderBottom: `1px solid ${C.muted}22` }}>
+            TABLE CHAT
+          </div>
+          <div ref={listRef} style={{ flex: 1, overflowY: "auto", padding: "10px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+            {msgs.length === 0 && <p style={{ color: C.muted, fontSize: 13 }}>Say something…</p>}
+            {msgs.map((m) => (
+              <div key={m.id} style={{ fontSize: 13, lineHeight: 1.4, wordBreak: "break-word" }}>
+                <b style={{ color: m.deviceId === myDeviceId ? C.amber : C.violet }}>{m.name}</b>{" "}
+                <span style={{ color: C.bone }}>{m.text}</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 6, padding: 10, borderTop: `1px solid ${C.muted}22` }}>
+            <input
+              value={chatIn}
+              onChange={(e) => setChatIn(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && onSend()}
+              placeholder="Say something…"
+              style={{ ...inp, marginTop: 0, fontSize: 14, padding: "8px 10px" }}
+            />
+            <Btn small disabled={!chatIn.trim()} onClick={onSend}>
+              Send
+            </Btn>
+          </div>
+        </div>
+      )}
+      <button
+        onClick={onToggle}
+        title="Table chat"
+        style={{
+          position: "relative",
+          width: 52,
+          height: 52,
+          borderRadius: "50%",
+          border: "none",
+          background: C.amber,
+          color: C.night,
+          fontSize: 22,
+          cursor: "pointer",
+          boxShadow: "0 8px 24px rgba(0,0,0,.4)",
+          touchAction: "manipulation",
+        }}
+      >
+        💬
+        {!open && unread > 0 && (
+          <span
+            style={{
+              position: "absolute",
+              top: -4,
+              right: -4,
+              minWidth: 18,
+              height: 18,
+              borderRadius: 9,
+              background: "#e0554f",
+              color: "#fff",
+              fontSize: 11,
+              fontWeight: 700,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "0 4px",
+            }}
+          >
+            {unread > 9 ? "9+" : unread}
+          </span>
+        )}
+      </button>
+    </div>
+  );
+}
+
 function Row({ label, children }) {
   return (
     <div>
@@ -847,6 +960,24 @@ export default function App() {
   const confettiRef = useConfetti(core?.phase === "end");
   const prevPhaseRef = useRef(null);
 
+  /* ---- table chat: ephemeral, relayed live over the same room channel ---- */
+  const channelRef = useRef(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMsgs, setChatMsgs] = useState([]);
+  const [chatIn, setChatIn] = useState("");
+  const [chatUnread, setChatUnread] = useState(0);
+
+  /* ---- voice clue: record → upload → replayable for everyone ---- */
+  const canRecord = typeof window !== "undefined" && !!window.MediaRecorder && !!navigator.mediaDevices?.getUserMedia;
+  const MAX_REC_S = 12;
+  const [recState, setRecState] = useState("idle"); // idle | recording | recorded | uploading
+  const [recBlob, setRecBlob] = useState(null);
+  const [recUrl, setRecUrl] = useState(null);
+  const [recSecs, setRecSecs] = useState(0);
+  const mediaRecorderRef = useRef(null);
+  const recChunksRef = useRef([]);
+  const recTimerRef = useRef(null);
+
   /* ---- a soft chime on reveal, a small flourish on the win screen ---- */
   useEffect(() => {
     const phase = core?.phase;
@@ -869,6 +1000,9 @@ export default function App() {
 
   useEffect(() => {
     setSel(null);
+    setErr("");
+    discardRecording();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [core?.phase, core?.round]);
 
   /* ---- rejoin on load ---- */
@@ -894,6 +1028,7 @@ export default function App() {
   /* ---- realtime subscription + light fallback poll ---- */
   useEffect(() => {
     if (!code) return;
+    setChatMsgs([]);
     const channel = supabase
       .channel(`room-${code}`)
       .on(
@@ -903,7 +1038,15 @@ export default function App() {
           if (payload.new) setCore(rowToState(payload.new));
         }
       )
+      // Ephemeral table chat — nothing persisted, just relayed live to
+      // whoever's currently connected. Own messages are echoed locally
+      // below rather than round-tripped, so sending feels instant.
+      .on("broadcast", { event: "chat" }, ({ payload }) => {
+        setChatMsgs((m) => [...m.slice(-49), payload]);
+        if (payload.deviceId !== deviceId) setChatUnread((n) => n + 1);
+      })
       .subscribe();
+    channelRef.current = channel;
 
     const poll = setInterval(async () => {
       const { data } = await supabase.from("rooms").select("*").eq("code", code).single();
@@ -912,6 +1055,7 @@ export default function App() {
 
     return () => {
       supabase.removeChannel(channel);
+      channelRef.current = null;
       clearInterval(poll);
     };
   }, [code]);
@@ -925,6 +1069,23 @@ export default function App() {
     setCode("");
     setCore(null);
     setScreen("home");
+  };
+
+  const sendChat = () => {
+    const text = chatIn.trim().slice(0, 200);
+    if (!text || !channelRef.current || !me) return;
+    sound.unlock();
+    const payload = { id: crypto.randomUUID(), deviceId, name: me.name, text, t: Date.now() };
+    channelRef.current.send({ type: "broadcast", event: "chat", payload });
+    setChatMsgs((m) => [...m.slice(-49), payload]); // own message, echoed locally
+    setChatIn("");
+  };
+
+  const toggleChat = () => {
+    setChatOpen((o) => {
+      if (!o) setChatUnread(0);
+      return !o;
+    });
   };
 
   /* ---- lobby actions ---- */
@@ -1013,6 +1174,81 @@ export default function App() {
     return withRoom(code, (s) => applyAction(s, me.id, { type, round: s.round, phase: s.phase, ...extra })).then(
       (r) => r.ok && setCore(r.state)
     );
+  };
+
+  /* ---- voice clue recording ---- */
+  const discardRecording = () => {
+    if (recUrl) URL.revokeObjectURL(recUrl);
+    setRecBlob(null);
+    setRecUrl(null);
+    setRecState("idle");
+    setRecSecs(0);
+  };
+
+  const startRecording = async () => {
+    sound.unlock();
+    setErr("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mime = ["audio/webm", "audio/mp4", "audio/ogg"].find((t) => window.MediaRecorder.isTypeSupported?.(t));
+      const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      recChunksRef.current = [];
+      rec.ondataavailable = (e) => e.data.size && recChunksRef.current.push(e.data);
+      rec.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(recChunksRef.current, { type: rec.mimeType || "audio/webm" });
+        setRecBlob(blob);
+        setRecUrl(URL.createObjectURL(blob));
+        setRecState("recorded");
+      };
+      mediaRecorderRef.current = rec;
+      rec.start();
+      setRecState("recording");
+      setRecSecs(0);
+      recTimerRef.current = setInterval(() => {
+        setRecSecs((s) => {
+          if (s + 1 >= MAX_REC_S) {
+            if (mediaRecorderRef.current?.state === "recording") mediaRecorderRef.current.stop();
+            clearInterval(recTimerRef.current);
+            return MAX_REC_S;
+          }
+          return s + 1;
+        });
+      }, 1000);
+    } catch {
+      setErr("Couldn't reach your microphone — check the browser's permission prompt.");
+    }
+  };
+
+  const stopRecording = () => {
+    clearInterval(recTimerRef.current);
+    if (mediaRecorderRef.current?.state === "recording") mediaRecorderRef.current.stop();
+  };
+
+  /* Uploads the clip (if any) then submits the clue — same "Tell it" flow,
+     just with an optional voice clip riding alongside the typed text. */
+  const tellIt = async () => {
+    if (sel === null || (!clueIn.trim() && !recBlob)) return;
+    sound.unlock();
+    let clueAudioUrl = null;
+    if (recBlob) {
+      setRecState("uploading");
+      const ext = recBlob.type.includes("mp4") ? "m4a" : recBlob.type.includes("ogg") ? "ogg" : "webm";
+      const path = `${code}/${core.round}-${Date.now()}.${ext}`;
+      const { error } = await supabase.storage.from("clue-audio").upload(path, recBlob, { contentType: recBlob.type });
+      if (!error) {
+        clueAudioUrl = supabase.storage.from("clue-audio").getPublicUrl(path).data.publicUrl;
+      } else {
+        setErr("Voice clue didn't upload. (Has the clue-audio Supabase setup been run?) Type a clue instead, or try recording again.");
+        if (!clueIn.trim()) {
+          setRecState("recorded"); // keep the clip so they can retry rather than silently losing it
+          return;
+        }
+      }
+    }
+    await act("clue", { card: sel, clue: clueIn.trim(), clueAudioUrl });
+    setClueIn("");
+    discardRecording();
   };
 
   /* ---- derived ---- */
@@ -1168,6 +1404,16 @@ export default function App() {
           )}
           {err && <p style={{ color: C.amber, fontSize: 13, marginTop: 14 }}>{err}</p>}
         </div>
+        <ChatPanel
+          open={chatOpen}
+          onToggle={toggleChat}
+          msgs={chatMsgs}
+          myDeviceId={deviceId}
+          chatIn={chatIn}
+          setChatIn={setChatIn}
+          onSend={sendChat}
+          unread={chatUnread}
+        />
       </div>
     );
   }
@@ -1194,6 +1440,16 @@ export default function App() {
             </div>
           )}
         </div>
+        <ChatPanel
+          open={chatOpen}
+          onToggle={toggleChat}
+          msgs={chatMsgs}
+          myDeviceId={deviceId}
+          chatIn={chatIn}
+          setChatIn={setChatIn}
+          onSend={sendChat}
+          unread={chatUnread}
+        />
       </div>
     );
   }
@@ -1245,11 +1501,22 @@ export default function App() {
           <div style={{ fontSize: 11, letterSpacing: 2, color: C.muted, marginBottom: 10 }}>
             {phaseLine().toUpperCase()}
           </div>
-          {core.clue ? (
-            <div style={{ ...display, fontSize: "clamp(26px,6vw,46px)", lineHeight: 1.15, color: C.bone }}>
-              <span style={{ color: C.amber, opacity: 0.6 }}>“</span>
-              {core.clue}
-              <span style={{ color: C.amber, opacity: 0.6 }}>”</span>
+          {core.clue || core.clueAudioUrl ? (
+            <div>
+              {core.clue && (
+                <div style={{ ...display, fontSize: "clamp(26px,6vw,46px)", lineHeight: 1.15, color: C.bone }}>
+                  <span style={{ color: C.amber, opacity: 0.6 }}>“</span>
+                  {core.clue}
+                  <span style={{ color: C.amber, opacity: 0.6 }}>”</span>
+                </div>
+              )}
+              {core.clueAudioUrl && (
+                <audio
+                  controls
+                  src={core.clueAudioUrl}
+                  style={{ marginTop: core.clue ? 14 : 4, height: 36, maxWidth: 320, width: "100%" }}
+                />
+              )}
             </div>
           ) : (
             <div style={{ ...display, fontSize: 26, color: C.muted }}>…</div>
@@ -1271,16 +1538,43 @@ export default function App() {
                 placeholder="a word, a phrase, a sound…"
                 style={{ ...inp, marginTop: 0, flex: "1 1 240px" }}
               />
-              <Btn
-                disabled={sel === null || !clueIn.trim()}
-                onClick={() => {
-                  act("clue", { card: sel, clue: clueIn.trim() });
-                  setClueIn("");
-                }}
-              >
-                Tell it
+              <Btn disabled={sel === null || (!clueIn.trim() && !recBlob) || recState === "uploading"} onClick={tellIt}>
+                {recState === "uploading" ? "Sending…" : "Tell it"}
               </Btn>
             </div>
+
+            {canRecord && (
+              <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                {recState === "idle" && (
+                  <button
+                    onClick={startRecording}
+                    style={{ ...linkBtnStyle, marginLeft: 0, textDecoration: "none", fontSize: 13 }}
+                  >
+                    🎤 or record a voice clue instead
+                  </button>
+                )}
+                {recState === "recording" && (
+                  <>
+                    <span className="fabel-pulse" style={{ width: 10, height: 10, borderRadius: "50%", background: "#e0554f", display: "inline-block" }} />
+                    <span style={{ fontSize: 13, color: C.muted }}>
+                      Recording… {recSecs}s / {MAX_REC_S}s
+                    </span>
+                    <Btn small tone="ghost" onClick={stopRecording}>
+                      Stop
+                    </Btn>
+                  </>
+                )}
+                {recState === "recorded" && recUrl && (
+                  <>
+                    <audio controls src={recUrl} style={{ height: 32, maxWidth: 220 }} />
+                    <button onClick={discardRecording} style={{ ...linkBtnStyle, marginLeft: 0, fontSize: 13 }}>
+                      re-record
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+            {err && <p style={{ color: C.amber, fontSize: 13, marginTop: 10 }}>{err}</p>}
           </>
         )}
         {core.phase === "clue" && !iAmSt && (
@@ -1403,6 +1697,16 @@ export default function App() {
         )}
         </div>
       </div>
+      <ChatPanel
+        open={chatOpen}
+        onToggle={toggleChat}
+        msgs={chatMsgs}
+        myDeviceId={deviceId}
+        chatIn={chatIn}
+        setChatIn={setChatIn}
+        onSend={sendChat}
+        unread={chatUnread}
+      />
     </div>
   );
 }
