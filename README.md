@@ -39,9 +39,9 @@ Once you've generated and culled images (see `deck-kit.md` from earlier), drop t
 https://<username>.github.io/<repo>/cards/card-01.jpg
 ```
 
-On the home screen, click **"USE /cards FOLDER"** next to the card images box — it fills in all 84 URLs for you, resolved from wherever the site is actually hosted (works the same on localhost and on GitHub Pages). Any card that fails to load falls back to the painted placeholder for that slot, so a partial deck never shows a broken image. Once you create a room with a deck, it's remembered in your browser for next time.
+On the home screen, set the number next to **"USE /cards FOLDER"** to however many cards you have (defaults to 84, but bump it as your deck grows — there's no ceiling baked into the app), then click the button — it fills in that many `card-NN.jpg` URLs for you, resolved from wherever the site is actually hosted (works the same on localhost and on GitHub Pages). Any card that fails to load falls back to the painted placeholder for that slot, so a partial deck never shows a broken image. Once you create a room, both the deck and the count you used are remembered in your browser for next time.
 
-You don't have to use exactly 84 — pass a different card count to `autofillDeck()` in `src/App.jsx` (search `USE /cards FOLDER`) if your deck is a different size, or just paste your own list of URLs (one per line) into the box directly.
+Don't need the autofill convenience? Just paste your own list of URLs (one per line) into the box directly instead.
 
 ## Notes
 

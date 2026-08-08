@@ -162,7 +162,7 @@ function CardBack() {
 }
 
 /* ---------- game logic (pure — same rules as before) ---------- */
-function freshCore(code, host, deckUrls) {
+function freshCore(code, host, deckUrls, deckSize = 84) {
   return {
     code,
     hostId: host.id,
@@ -170,7 +170,7 @@ function freshCore(code, host, deckUrls) {
     round: 0,
     players: [{ id: host.id, name: host.name, score: 0 }],
     deckUrls: deckUrls || [],
-    deckSize: 84,
+    deckSize,
     pile: [],
     discard: [],
     hands: {},
@@ -949,6 +949,13 @@ export default function App() {
       return "";
     }
   });
+  const [deckCount, setDeckCount] = useState(() => {
+    try {
+      return Number(localStorage.getItem("fabel:deckCount")) || 84;
+    } catch {
+      return 84;
+    }
+  });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [restoring, setRestoring] = useState(true);
@@ -1101,13 +1108,14 @@ export default function App() {
 
     for (let i = 0; i < 4; i++) {
       const c = code4();
-      const state = freshCore(c, player, urls);
+      const state = freshCore(c, player, urls, deckCount);
       const { data, error } = await supabase.from("rooms").insert(stateToRow(state)).select().single();
       if (!error && data) {
         saveSeat(c, player);
         try {
           if (urls.length) localStorage.setItem("fabel:deck", deckIn);
           else localStorage.removeItem("fabel:deck");
+          localStorage.setItem("fabel:deckCount", String(deckCount));
         } catch {}
         setMe(player);
         setCode(c);
@@ -1127,7 +1135,7 @@ export default function App() {
      on a GitHub Pages subpath, no need to type your own repo URL. Normalizes
      to a trailing-slash directory first so it can't resolve one level too
      high if the page happened to load without one. */
-  const autofillDeck = (count = 84) => {
+  const autofillDeck = (count = deckCount) => {
     const here = new URL(window.location.href);
     if (!here.pathname.endsWith("/")) {
       here.pathname = here.pathname.slice(0, here.pathname.lastIndexOf("/") + 1);
@@ -1321,9 +1329,30 @@ export default function App() {
             <label style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>
               CARD IMAGES (optional — one URL per line)
             </label>
-            <button onClick={() => autofillDeck(84)} style={{ ...linkBtnStyle, marginLeft: 0 }}>
-              USE /cards FOLDER
-            </button>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input
+                type="number"
+                min={12}
+                max={998}
+                value={deckCount}
+                onChange={(e) => setDeckCount(Math.max(12, Math.min(998, Number(e.target.value) || 84)))}
+                title="How many card-NN.jpg slots to fill in"
+                style={{
+                  width: 56,
+                  boxSizing: "border-box",
+                  padding: "4px 6px",
+                  borderRadius: 6,
+                  border: `1px solid ${C.muted}44`,
+                  background: "#0B1A20",
+                  color: C.bone,
+                  fontSize: 12,
+                  fontFamily: "Inter, system-ui, sans-serif",
+                }}
+              />
+              <button onClick={() => autofillDeck(deckCount)} style={{ ...linkBtnStyle, marginLeft: 0 }}>
+                USE /cards FOLDER
+              </button>
+            </div>
           </div>
           <textarea
             value={deckIn}
@@ -1333,8 +1362,9 @@ export default function App() {
             style={{ ...inp, resize: "vertical", fontSize: 12 }}
           />
           <p style={{ fontSize: 11, color: C.muted, marginTop: 6, lineHeight: 1.5 }}>
-            "Use /cards folder" fills in card-01.jpg … card-84.jpg from this same site. Any card image that
-            fails to load just falls back to the painted placeholder for that card.
+            "Use /cards folder" fills in card-01.jpg … card-{String(deckCount).padStart(2, "0")}.jpg from this
+            same site — bump the number on the left as your deck grows past 84. Any card image that fails to
+            load just falls back to the painted placeholder for that card.
           </p>
           <div style={{ marginTop: 14 }}>
             <Btn onClick={createRoom} disabled={busy}>
@@ -1391,7 +1421,7 @@ export default function App() {
             ))}
           </ul>
           <p style={{ color: C.muted, fontSize: 13, marginTop: 18 }}>
-            Deck: {core.deckUrls.length ? `${core.deckUrls.length} of your images` : "84 painted placeholders"}
+            Deck: {core.deckUrls.length ? `${core.deckUrls.length} of your images` : `${core.deckSize} painted placeholders`}
           </p>
           {isHost ? (
             <div style={{ marginTop: 22 }}>
