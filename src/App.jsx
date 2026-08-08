@@ -701,7 +701,7 @@ const linkBtnStyle = {
 function Header({ code, display, round, onLeave, onHelp, soundOn, onToggleSound }) {
   return (
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
-      <span style={{ ...display, fontSize: 24 }}>Fabel</span>
+      <span style={{ ...display, fontSize: 24 }}>DitFofs</span>
       <span style={{ fontSize: 12, color: C.muted, letterSpacing: 2, display: "inline-flex", alignItems: "baseline" }}>
         {round ? `ROUND ${round} · ` : ""}
         {code}
@@ -1294,7 +1294,7 @@ export default function App() {
             <div style={{ width: 92, margin: "0 auto 18px" }}>
               <CardBack />
             </div>
-            <h1 style={{ ...display, fontSize: 52, margin: 0, lineHeight: 1 }}>Fabel</h1>
+            <h1 style={{ ...display, fontSize: 52, margin: 0, lineHeight: 1 }}>DitFofs</h1>
             <p style={{ color: C.muted, marginTop: 10, fontSize: 14 }}>
               Give a clue. Hide your card. Guess the teller.
             </p>

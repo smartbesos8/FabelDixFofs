@@ -1,4 +1,4 @@
-# Fabel
+# DitFofs
 
 A Dixit-style storytelling card game, synced live over Supabase.
 
