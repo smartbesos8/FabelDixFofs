@@ -62,9 +62,31 @@ function clearSeat() {
 // Opens Google Translate (website, or the app if installed) with the clue
 // filled in, auto-detecting its language and translating into the
 // player's own phone/browser language. Free, no API key involved.
+function myLang() {
+  return (typeof navigator !== "undefined" && (navigator.language || "en").split("-")[0]) || "en";
+}
 function translateUrl(text) {
-  const lang = (typeof navigator !== "undefined" && (navigator.language || "en").split("-")[0]) || "en";
-  return `https://translate.google.com/?sl=auto&tl=${encodeURIComponent(lang)}&text=${encodeURIComponent(text)}&op=translate`;
+  return `https://translate.google.com/?sl=auto&tl=${encodeURIComponent(myLang())}&text=${encodeURIComponent(text)}&op=translate`;
+}
+// In-page translation, so nobody has to leave the game (and so it works on
+// Android, where the Translate app hijacks translate.google.com links and
+// drops the text). Uses Google's free keyless web endpoint — unofficial, so
+// if it ever stops answering we fall back to the plain link above.
+async function translateText(text) {
+  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(myLang())}&dt=t&q=${encodeURIComponent(text)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("translate " + res.status);
+  const data = await res.json();
+  const out = (data?.[0] || []).map((part) => part?.[0] || "").join("").trim();
+  if (!out) throw new Error("empty translation");
+  return { text: out, from: data?.[2] || "" };
+}
+function langName(code) {
+  try {
+    return new Intl.DisplayNames([myLang()], { type: "language" }).of(code) || code;
+  } catch {
+    return code;
+  }
 }
 
 const mulberry32 = (a) => () => {
@@ -1562,6 +1584,7 @@ export default function App() {
   const recChunksRef = useRef([]);
   const recTimerRef = useRef(null);
   const clueInputRef = useRef(null);
+  const [clueTr, setClueTr] = useState(null); // { for: clueText, text?, from?, loading?, failed? }
 
   /* ---- a soft chime on reveal, a small flourish on the win screen ---- */
   useEffect(() => {
@@ -2247,24 +2270,45 @@ export default function App() {
                   <span style={{ color: C.amber, opacity: 0.6 }}>”</span>
                 </div>
               )}
-              {core.clue && (
-                <a
-                  href={translateUrl(core.clue)}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  style={{
-                    display: "inline-block",
-                    marginTop: 8,
-                    padding: "6px 10px",
-                    fontSize: 13,
-                    color: C.muted,
-                    textDecoration: "underline",
-                    touchAction: "manipulation",
-                  }}
-                >
-                  🌐 Translate this clue
-                </a>
-              )}
+              {core.clue && (() => {
+                const tr = clueTr?.for === core.clue ? clueTr : null;
+                const linkStyle = { ...linkBtnStyle, marginLeft: 0, fontSize: 13, padding: "6px 10px" };
+                if (tr?.text)
+                  return (
+                    <div style={{ marginTop: 10, fontSize: 16, color: C.bone, fontStyle: "italic" }}>
+                      🌐 {tr.text}
+                      {tr.from && (
+                        <div style={{ fontSize: 11, color: C.muted, fontStyle: "normal", marginTop: 4 }}>
+                          translated from {langName(tr.from)} · machine translation, may miss the nuance
+                        </div>
+                      )}
+                    </div>
+                  );
+                if (tr?.failed)
+                  return (
+                    <a href={translateUrl(core.clue)} target="_blank" rel="noopener noreferrer" style={{ ...linkStyle, display: "inline-block", marginTop: 8 }}>
+                      Couldn't translate here — open in Google Translate
+                    </a>
+                  );
+                return (
+                  <button
+                    disabled={tr?.loading}
+                    onClick={async () => {
+                      const clue = core.clue;
+                      setClueTr({ for: clue, loading: true });
+                      try {
+                        const r = await translateText(clue);
+                        setClueTr({ for: clue, ...r });
+                      } catch {
+                        setClueTr({ for: clue, failed: true });
+                      }
+                    }}
+                    style={{ ...linkStyle, display: "inline-block", marginTop: 8 }}
+                  >
+                    {tr?.loading ? "Translating…" : "🌐 Translate this clue"}
+                  </button>
+                );
+              })()}
               {core.clueAudioUrl && (
                 <audio
                   controls
