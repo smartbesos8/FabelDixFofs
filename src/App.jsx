@@ -42,6 +42,7 @@ function getDeviceId() {
 function saveSeat(code, player) {
   try {
     localStorage.setItem(SEAT_KEY, JSON.stringify({ code, id: player.id, name: player.name }));
+    localStorage.setItem("fabel:name", player.name); // pre-fills the name box next visit
   } catch {}
 }
 function loadSeat() {
@@ -266,6 +267,66 @@ function nextRound(core) {
   core.result = null;
 }
 
+function clearRound(core) {
+  core.clue = "";
+  core.clueAudioUrl = null;
+  core.storytellerCard = null;
+  core.submissions = [];
+  core.votes = {};
+  core.result = null;
+}
+
+function resetToLobby(core) {
+  core.submissions.forEach((s) => core.discard.push(s.card));
+  core.phase = "lobby";
+  core.round = 0;
+  core.storytellerIdx = 0;
+  clearRound(core);
+}
+
+/* Someone walks away — at any point. Keeps the room playable for whoever's
+   left: hands the host role on, drops their card/vote from the current
+   round, and finishes or restarts the round if they were what it was
+   waiting on. Under 3 players, the table goes back to the lobby. */
+function leaveRoom(core, pid) {
+  const idx = core.players.findIndex((p) => p.id === pid);
+  if (idx === -1) return;
+  const wasSt = idx === core.storytellerIdx;
+  core.players.splice(idx, 1);
+  delete core.hands[pid];
+  if (core.hostId === pid && core.players.length) core.hostId = core.players[0].id;
+  if (idx < core.storytellerIdx) core.storytellerIdx -= 1;
+  if (core.storytellerIdx >= core.players.length) core.storytellerIdx = 0;
+
+  const inRound = ["clue", "submit", "vote", "reveal"].includes(core.phase);
+  if (!inRound) return;
+  if (core.players.length < 3) return resetToLobby(core);
+
+  if (wasSt && core.phase !== "reveal") {
+    // the teller left mid-round — scrap the round, next player tells
+    core.submissions.forEach((s) => core.discard.push(s.card));
+    core.players.forEach((p) => drawTo(core, p.id));
+    core.round += 1;
+    core.phase = "clue";
+    clearRound(core);
+    return;
+  }
+
+  const mine = core.submissions.find((s) => s.playerId === pid);
+  if (mine && core.phase !== "reveal") {
+    core.discard.push(mine.card);
+    core.submissions = core.submissions.filter((s) => s.playerId !== pid);
+    Object.keys(core.votes).forEach((v) => core.votes[v] === mine.card && delete core.votes[v]);
+  }
+  delete core.votes[pid];
+  if (core.phase === "submit" && core.submissions.length === core.players.length) {
+    core.submissions = shuffle(core.submissions);
+    core.phase = "vote";
+  } else if (core.phase === "vote" && Object.keys(core.votes).length === core.players.length - 1) {
+    tally(core);
+  }
+}
+
 /* Applies one player's action directly against the current state.
    No queue, no seq numbers — Postgres's own atomic UPDATE (below) is what
    keeps two simultaneous actions from clobbering each other, so this just
@@ -281,9 +342,13 @@ function applyAction(core, pid, act) {
     return true;
   }
   if (act.type === "leave") {
-    core.players = core.players.filter((p) => p.id !== pid);
-    delete core.hands[pid];
-    if (core.storytellerIdx >= core.players.length) core.storytellerIdx = 0;
+    leaveRoom(core, pid);
+    return true;
+  }
+  if (act.type === "lobby") {
+    // host sends everyone back to the lobby, so people can leave or new ones join
+    if (pid !== core.hostId || core.phase !== "end") return false;
+    resetToLobby(core);
     return true;
   }
   if (act.type === "start") {
@@ -424,6 +489,24 @@ function useGlobalStyles() {
     s.textContent = `
       html, body, #root { max-width: 100%; overflow-x: hidden; }
       * { -webkit-tap-highlight-color: transparent; }
+      input::placeholder, textarea::placeholder { color: ${C.muted}; font-weight: 400; font-style: italic; opacity: .75; letter-spacing: normal; }
+
+      /* Card sizes: desktop rows wrap; on phones cards get much bigger and
+         the row becomes a sideways swipe, snapping card by card. */
+      :root { --hand-w: 132px; --table-w: 150px; }
+      .fabel-row { display: flex; gap: 12px; flex-wrap: wrap; padding-bottom: 10px; }
+      .fabel-swipe-hint { display: none; }
+      @media (max-width: 640px) {
+        :root { --hand-w: 46vw; --table-w: 62vw; }
+        .fabel-row {
+          flex-wrap: nowrap; overflow-x: auto; scroll-snap-type: x mandatory;
+          -webkit-overflow-scrolling: touch; padding: 8px 4px 14px; margin: 0 -4px;
+          scrollbar-width: none;
+        }
+        .fabel-row::-webkit-scrollbar { display: none; }
+        .fabel-row > * { scroll-snap-align: center; }
+        .fabel-swipe-hint { display: block; }
+      }
       @keyframes fabelFade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
       .fabel-fade { animation: fabelFade .38s ease; }
       @keyframes fabelPulse { 0%, 100% { box-shadow: 0 0 0 0 ${C.violet}55; } 50% { box-shadow: 0 0 0 8px ${C.violet}00; } }
@@ -498,6 +581,27 @@ function useSound() {
     [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, i * 0.1, 0.55, 0.04));
   }, [tone]);
 
+  // a quiet tick for an ordinary chat message
+  const blip = useCallback(() => tone(740, 0, 0.16, 0.035), [tone]);
+
+  // hard-to-miss three-note call for a message flagged important
+  const alert = useCallback(() => {
+    [988, 784, 988].forEach((f, i) => tone(f, i * 0.18, 0.3, 0.08, "triangle"));
+  }, [tone]);
+
+  // Browsers only allow audio after the person has interacted with the page,
+  // so unlock on their very first tap/keypress anywhere — otherwise someone
+  // who's just watching would never hear chat or the reveal chime.
+  useEffect(() => {
+    const unlock = () => ensureCtx();
+    window.addEventListener("pointerdown", unlock, { once: true });
+    window.addEventListener("keydown", unlock, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("keydown", unlock);
+    };
+  }, [ensureCtx]);
+
   const toggle = useCallback(() => {
     setEnabled((e) => {
       const next = !e;
@@ -508,7 +612,7 @@ function useSound() {
     });
   }, []);
 
-  return { enabled, toggle, chime, flourish, unlock: ensureCtx };
+  return { enabled, toggle, chime, flourish, blip, alert, unlock: ensureCtx };
 }
 
 /* ---------- a light canvas confetti burst for the win screen ---------- */
@@ -596,12 +700,12 @@ const Btn = ({ children, onClick, disabled, tone = "amber", small }) => (
   </button>
 );
 
-const HAND_CARD_W = "clamp(92px, 26vw, 132px)";
-const TABLE_CARD_W = "clamp(108px, 32vw, 150px)";
+const HAND_CARD_W = "var(--hand-w)";
+const TABLE_CARD_W = "var(--table-w)";
 
 /* `flip` makes the card mount face-down and turn face-up a beat later —
    used when cards land on the table so the reveal reads as a reveal. */
-function Card({ seed, url, selected, dim, onClick, badge, width = HAND_CARD_W, flip, flipDelay = 0 }) {
+function Card({ seed, url, selected, dim, onClick, badge, width = HAND_CARD_W, flip, flipDelay = 0, onZoom }) {
   const [revealed, setRevealed] = useState(!flip);
   useEffect(() => {
     if (!flip) return;
@@ -649,6 +753,34 @@ function Card({ seed, url, selected, dim, onClick, badge, width = HAND_CARD_W, f
               {badge}
             </div>
           )}
+          {onZoom && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onZoom();
+              }}
+              title="Look closer"
+              aria-label="Enlarge card"
+              style={{
+                position: "absolute",
+                top: 6,
+                right: 6,
+                width: 34,
+                height: 34,
+                borderRadius: "50%",
+                border: "none",
+                background: "rgba(8,18,22,.72)",
+                color: C.bone,
+                fontSize: 16,
+                lineHeight: "34px",
+                padding: 0,
+                cursor: "zoom-in",
+                touchAction: "manipulation",
+              }}
+            >
+              🔍
+            </button>
+          )}
         </>
       )}
     </div>
@@ -688,15 +820,298 @@ function Card({ seed, url, selected, dim, onClick, badge, width = HAND_CARD_W, f
 }
 
 const linkBtnStyle = {
-  marginLeft: 12,
+  marginLeft: 6,
+  padding: "8px 6px",
   background: "none",
   border: "none",
   color: C.muted,
-  fontSize: 11,
+  fontSize: 12,
   cursor: "pointer",
   letterSpacing: 1,
   textDecoration: "underline",
+  touchAction: "manipulation",
 };
+
+/* Lets the phone's Back button (or Escape) close an overlay instead of
+   leaving the page: opening pushes a history entry, Back pops it. */
+function useBackToClose(open, close) {
+  const closeRef = useRef(close);
+  closeRef.current = close;
+  const pushed = useRef(false);
+  useEffect(() => {
+    if (!open) return;
+    window.history.pushState({ ditfofsOverlay: true }, "");
+    pushed.current = true;
+    const onPop = () => {
+      pushed.current = false;
+      closeRef.current();
+    };
+    const onKey = (e) => e.key === "Escape" && closeRef.current();
+    window.addEventListener("popstate", onPop);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("popstate", onPop);
+      window.removeEventListener("keydown", onKey);
+      // closed some other way (✕ button) — drop the history entry we added
+      if (pushed.current) {
+        pushed.current = false;
+        window.history.back();
+      }
+    };
+  }, [open]);
+}
+
+const overlayStyle = {
+  position: "fixed",
+  inset: 0,
+  background: "rgba(6,14,18,.82)",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  zIndex: 60,
+  padding: 16,
+};
+
+const closeXStyle = {
+  background: "none",
+  border: "none",
+  color: C.muted,
+  fontSize: 26,
+  cursor: "pointer",
+  lineHeight: 1,
+  padding: "4px 8px",
+  touchAction: "manipulation",
+};
+
+/* Full-screen card viewer: swipe or arrows to flip through the row,
+   optional "choose this card" action at the bottom. */
+function Lightbox({ zoom, onClose }) {
+  const [i, setI] = useState(zoom.index);
+  const touchX = useRef(null);
+  const n = zoom.items.length;
+  const go = (d) => setI((x) => (x + d + n) % n);
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "ArrowRight") go(1);
+      if (e.key === "ArrowLeft") go(-1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [n]);
+  const item = zoom.items[i];
+  const canPick = zoom.onPick && (!zoom.canPick || zoom.canPick(item));
+  const arrow = { ...closeXStyle, fontSize: 34, color: C.bone, padding: "8px 12px" };
+
+  return (
+    <div onClick={onClose} style={{ ...overlayStyle, flexDirection: "column", gap: 14 }}>
+      <button onClick={onClose} aria-label="Close" style={{ ...closeXStyle, position: "absolute", top: 10, right: 10, color: C.bone, fontSize: 32 }}>
+        ✕
+      </button>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        onTouchStart={(e) => (touchX.current = e.touches[0].clientX)}
+        onTouchEnd={(e) => {
+          if (touchX.current === null) return;
+          const dx = e.changedTouches[0].clientX - touchX.current;
+          if (Math.abs(dx) > 40) go(dx < 0 ? 1 : -1);
+          touchX.current = null;
+        }}
+        style={{ display: "flex", alignItems: "center", gap: 6 }}
+      >
+        {n > 1 && (
+          <button onClick={() => go(-1)} aria-label="Previous card" style={arrow}>
+            ‹
+          </button>
+        )}
+        <div
+          style={{
+            width: "min(78vw, calc(74vh * 5 / 7), 460px)",
+            aspectRatio: "5 / 7",
+            borderRadius: 14,
+            overflow: "hidden",
+            boxShadow: "0 20px 60px rgba(0,0,0,.6)",
+            background: C.night2,
+          }}
+        >
+          <CardArt seed={item.seed} url={item.url} />
+        </div>
+        {n > 1 && (
+          <button onClick={() => go(1)} aria-label="Next card" style={arrow}>
+            ›
+          </button>
+        )}
+      </div>
+      <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", alignItems: "center", gap: 14, color: C.muted, fontSize: 13 }}>
+        {n > 1 && <span>{i + 1} / {n}</span>}
+        {item.label && <span style={{ color: C.bone }}>{item.label}</span>}
+        {canPick && (
+          <Btn
+            onClick={() => {
+              zoom.onPick(item);
+              onClose();
+            }}
+          >
+            {zoom.pickLabel || "Choose this card"}
+          </Btn>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* Step-by-step "my microphone won't work" guide, most likely platform first. */
+function MicHelp({ onClose, display, reason }) {
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+  const inApp = /WhatsApp|FBAN|FBAV|Instagram|Line\//i.test(ua);
+  const ios = /iPhone|iPad|iPod/i.test(ua);
+  const android = /Android/i.test(ua);
+  const sections = [
+    {
+      key: "inapp",
+      show: true,
+      title: "Opened from WhatsApp? Open it in your real browser first",
+      steps: [
+        "Links tapped inside WhatsApp open in WhatsApp's own mini-browser, which often blocks the microphone.",
+        ios ? "Tap the share/compass icon at the bottom and choose “Open in Safari”." : "Tap ⋮ (top right) and choose “Open in Chrome” / “Open in browser”.",
+        "Then rejoin the room — you'll keep your seat.",
+      ],
+    },
+    {
+      key: "ios",
+      show: true,
+      title: "iPhone / iPad (Safari)",
+      steps: [
+        "Tap “aA” (or the ⋯ icon) in the address bar → Website Settings → Microphone → Allow.",
+        "Still blocked? iPhone Settings → Apps → Safari → Microphone → Ask or Allow.",
+        "Reload the page and try 🎤 again — say Allow when it asks.",
+      ],
+    },
+    {
+      key: "android",
+      show: true,
+      title: "Android (Chrome)",
+      steps: [
+        "Tap the icon left of the web address (🔒 or ⚙︎) → Permissions → Microphone → Allow.",
+        "Still blocked? Phone Settings → Apps → Chrome → Permissions → Microphone → Allow only while using the app.",
+        "Reload the page and try 🎤 again.",
+      ],
+    },
+    {
+      key: "desktop",
+      show: true,
+      title: "Laptop / desktop (Chrome, Edge, Firefox)",
+      steps: [
+        "Click the icon left of the web address → Microphone → Allow, then reload.",
+        "Windows: Settings → Privacy & security → Microphone → turn on access for your browser.",
+        "Mac: System Settings → Privacy & Security → Microphone → tick your browser.",
+        "Make sure a microphone is plugged in / not muted, and no other app is using it.",
+      ],
+    },
+  ];
+  const first = inApp ? "inapp" : ios ? "ios" : android ? "android" : "desktop";
+  const ordered = [...sections.filter((s) => s.key === first), ...sections.filter((s) => s.key !== first)];
+
+  return (
+    <div onClick={onClose} style={overlayStyle}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          maxWidth: 480,
+          width: "100%",
+          maxHeight: "86vh",
+          overflowY: "auto",
+          background: C.night2,
+          borderRadius: 16,
+          padding: "22px 22px 18px",
+          boxShadow: "0 20px 60px rgba(0,0,0,.5)",
+          color: C.bone,
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ ...display, fontSize: 22 }}>🎤 Getting the microphone working</span>
+          <button onClick={onClose} aria-label="Close" style={closeXStyle}>
+            ✕
+          </button>
+        </div>
+        {reason && <p style={{ color: C.amber, fontSize: 13, marginTop: 10, lineHeight: 1.5 }}>{reason}</p>}
+        <p style={{ fontSize: 13, color: C.muted, marginTop: 10, lineHeight: 1.6 }}>
+          A voice clue is optional — you can always just type your clue instead. To record, your browser has to
+          be allowed to use the microphone for this site:
+        </p>
+        {ordered.map((s, k) => (
+          <div key={s.key} style={{ marginTop: 16 }}>
+            <div style={{ fontWeight: 600, fontSize: 14, color: k === 0 ? C.amber : C.bone }}>
+              {k === 0 && "→ "}
+              {s.title}
+            </div>
+            <ol style={{ paddingLeft: 20, margin: "6px 0 0", fontSize: 13, lineHeight: 1.6, color: C.bone }}>
+              {s.steps.map((t, j) => (
+                <li key={j}>{t}</li>
+              ))}
+            </ol>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* "Put DitFofs on your home screen" — one-tap install on Android/desktop
+   Chrome when the browser offers it, step-by-step instructions otherwise. */
+function InstallHelp({ onClose, display, installPrompt, onInstall }) {
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+  const ios = /iPhone|iPad|iPod/i.test(ua);
+  const inApp = /WhatsApp|FBAN|FBAV|Instagram/i.test(ua);
+  const steps = inApp
+    ? [
+        "You're inside WhatsApp's mini-browser — first open this page in your normal browser:",
+        ios ? "tap the share/compass icon → “Open in Safari”." : "tap ⋮ → “Open in Chrome”.",
+        "Then come back to this button.",
+      ]
+    : ios
+    ? [
+        "Tap the Share button (the square with an arrow ↑) at the bottom of Safari.",
+        "Scroll down and tap “Add to Home Screen”.",
+        "Tap “Add”. DitFofs now has its own icon and opens full-screen.",
+      ]
+    : [
+        "Tap ⋮ (top right in Chrome).",
+        "Tap “Add to Home screen” or “Install app”.",
+        "Confirm. DitFofs now has its own icon and opens full-screen.",
+      ];
+
+  return (
+    <div onClick={onClose} style={overlayStyle}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ maxWidth: 440, width: "100%", background: C.night2, borderRadius: 16, padding: "22px", color: C.bone }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ ...display, fontSize: 22 }}>📲 Add to your home screen</span>
+          <button onClick={onClose} aria-label="Close" style={closeXStyle}>
+            ✕
+          </button>
+        </div>
+        {installPrompt && (
+          <div style={{ marginTop: 16 }}>
+            <Btn onClick={onInstall}>Install DitFofs</Btn>
+          </div>
+        )}
+        <ol style={{ paddingLeft: 20, marginTop: 16, fontSize: 14, lineHeight: 1.7 }}>
+          {steps.map((t, j) => (
+            <li key={j}>{t}</li>
+          ))}
+        </ol>
+        <p style={{ fontSize: 12, color: C.muted, marginTop: 12, lineHeight: 1.6 }}>
+          No app store, nothing to pay — it's just a shortcut to this page with its own icon. Share the same link with
+          others and they can do the same. (On iPhone the home-screen version keeps its own memory, so you may need to
+          type your name once more the first time.)
+        </p>
+      </div>
+    </div>
+  );
+}
 
 function Header({ code, display, round, onLeave, onHelp, soundOn, onToggleSound }) {
   return (
@@ -777,6 +1192,12 @@ function HelpPanel({ onClose, display }) {
           Updates arrive live — no need to tap twice. The ⏱ next to "still choosing" is a soft nudge, not a
           countdown that locks anyone out.
         </p>
+        <ul style={{ paddingLeft: 18, marginTop: 12, fontSize: 12, color: C.muted, lineHeight: 1.7 }}>
+          <li>🔍 on a card opens it big — swipe or use the arrows to look through the rest.</li>
+          <li>🎤 As the teller you can record your clue instead of typing it. Tap “mic not working?” if your browser blocks it.</li>
+          <li>💬 Chat with the table any time; tap ❗ before sending to make it ring loudly for everyone.</li>
+          <li>LEAVE (top right) always lets you out — the game carries on for the others.</li>
+        </ul>
       </div>
     </div>
   );
@@ -785,7 +1206,7 @@ function HelpPanel({ onClose, display }) {
 /* Floating table chat — ephemeral (nothing persisted), relayed live over
    Supabase Realtime broadcast. A round badge on the toggle shows unread
    count while closed. */
-function ChatPanel({ open, onToggle, msgs, myDeviceId, chatIn, setChatIn, onSend, unread }) {
+function ChatPanel({ open, onToggle, msgs, myDeviceId, chatIn, setChatIn, onSend, unread, important, setImportant }) {
   const listRef = useRef(null);
   useEffect(() => {
     if (open && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
@@ -817,25 +1238,70 @@ function ChatPanel({ open, onToggle, msgs, myDeviceId, chatIn, setChatIn, onSend
             overflow: "hidden",
           }}
         >
-          <div style={{ padding: "10px 14px", fontSize: 11, letterSpacing: 2, color: C.muted, borderBottom: `1px solid ${C.muted}22` }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              padding: "4px 6px 4px 14px",
+              fontSize: 11,
+              letterSpacing: 2,
+              color: C.muted,
+              borderBottom: `1px solid ${C.muted}22`,
+            }}
+          >
             TABLE CHAT
+            <button onClick={onToggle} aria-label="Close chat" style={{ ...closeXStyle, fontSize: 22 }}>
+              ✕
+            </button>
           </div>
           <div ref={listRef} style={{ flex: 1, overflowY: "auto", padding: "10px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
             {msgs.length === 0 && <p style={{ color: C.muted, fontSize: 13 }}>Say something…</p>}
             {msgs.map((m) => (
-              <div key={m.id} style={{ fontSize: 13, lineHeight: 1.4, wordBreak: "break-word" }}>
+              <div
+                key={m.id}
+                style={{
+                  fontSize: 13,
+                  lineHeight: 1.4,
+                  wordBreak: "break-word",
+                  ...(m.important
+                    ? { background: "#e0554f26", boxShadow: "inset 3px 0 0 #e0554f", borderRadius: 6, padding: "6px 8px" }
+                    : {}),
+                }}
+              >
+                {m.important && <span style={{ color: "#ff8a84", fontWeight: 700 }}>❗ </span>}
                 <b style={{ color: m.deviceId === myDeviceId ? C.amber : C.violet }}>{m.name}</b>{" "}
                 <span style={{ color: C.bone }}>{m.text}</span>
               </div>
             ))}
           </div>
-          <div style={{ display: "flex", gap: 6, padding: 10, borderTop: `1px solid ${C.muted}22` }}>
+          <div style={{ display: "flex", gap: 6, padding: 10, borderTop: `1px solid ${C.muted}22`, alignItems: "center" }}>
+            <button
+              onClick={() => setImportant(!important)}
+              title={important ? "Marked important — everyone gets an alert sound" : "Mark as important (plays an alert for everyone)"}
+              aria-pressed={important}
+              style={{
+                flex: "0 0 auto",
+                width: 36,
+                height: 36,
+                borderRadius: 8,
+                border: `1px solid ${important ? "#e0554f" : C.muted + "44"}`,
+                background: important ? "#e0554f33" : "transparent",
+                color: important ? "#ff8a84" : C.muted,
+                fontSize: 16,
+                fontWeight: 700,
+                cursor: "pointer",
+                touchAction: "manipulation",
+              }}
+            >
+              ❗
+            </button>
             <input
               value={chatIn}
               onChange={(e) => setChatIn(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && onSend()}
-              placeholder="Say something…"
-              style={{ ...inp, marginTop: 0, fontSize: 14, padding: "8px 10px" }}
+              placeholder={important ? "Important message…" : "Say something…"}
+              style={{ ...inp, marginTop: 0, padding: "8px 10px" }}
             />
             <Btn small disabled={!chatIn.trim()} onClick={onSend}>
               Send
@@ -845,22 +1311,23 @@ function ChatPanel({ open, onToggle, msgs, myDeviceId, chatIn, setChatIn, onSend
       )}
       <button
         onClick={onToggle}
-        title="Table chat"
+        title={open ? "Close chat" : "Table chat"}
+        aria-label={open ? "Close chat" : "Open table chat"}
         style={{
           position: "relative",
           width: 52,
           height: 52,
           borderRadius: "50%",
           border: "none",
-          background: C.amber,
-          color: C.night,
-          fontSize: 22,
+          background: open ? C.night3 : C.amber,
+          color: open ? C.bone : C.night,
+          fontSize: open ? 20 : 22,
           cursor: "pointer",
           boxShadow: "0 8px 24px rgba(0,0,0,.4)",
           touchAction: "manipulation",
         }}
       >
-        💬
+        {open ? "✕" : "💬"}
         {!open && unread > 0 && (
           <span
             style={{
@@ -892,8 +1359,9 @@ function Row({ label, children }) {
   return (
     <div>
       {label && <div style={{ fontSize: 11, letterSpacing: 2, color: C.muted, marginBottom: 10 }}>{label.toUpperCase()}</div>}
-      <div style={{ display: "flex", gap: 12, overflowX: "auto", paddingBottom: 10, flexWrap: "wrap" }}>
-        {children}
+      <div className="fabel-row">{children}</div>
+      <div className="fabel-swipe-hint" style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+        ← swipe to see all cards · tap 🔍 to look closer →
       </div>
     </div>
   );
@@ -938,7 +1406,13 @@ export default function App() {
   const [code, setCode] = useState("");
   const [core, setCore] = useState(null);
   const [screen, setScreen] = useState("home");
-  const [nameIn, setNameIn] = useState("");
+  const [nameIn, setNameIn] = useState(() => {
+    try {
+      return localStorage.getItem("fabel:name") || "";
+    } catch {
+      return "";
+    }
+  });
   const [codeIn, setCodeIn] = useState("");
   const [clueIn, setClueIn] = useState("");
   const [sel, setSel] = useState(null);
@@ -973,6 +1447,49 @@ export default function App() {
   const [chatMsgs, setChatMsgs] = useState([]);
   const [chatIn, setChatIn] = useState("");
   const [chatUnread, setChatUnread] = useState(0);
+  const [chatImportant, setChatImportant] = useState(false);
+  const [chatToast, setChatToast] = useState(null);
+  const chatOpenRef = useRef(false);
+  chatOpenRef.current = chatOpen;
+  const soundRef = useRef(sound);
+  soundRef.current = sound; // the realtime handler below outlives renders — read sound through a ref
+
+  /* ---- overlays: card viewer, mic help, home-screen install help ---- */
+  const [zoom, setZoom] = useState(null); // { items, index, onPick?, canPick?, pickLabel? }
+  const [micHelp, setMicHelp] = useState(null); // null | "" | reason text
+  const [showInstall, setShowInstall] = useState(false);
+  const [installPrompt, setInstallPrompt] = useState(null);
+  useBackToClose(chatOpen, () => setChatOpen(false));
+  useBackToClose(!!zoom, () => setZoom(null));
+  useBackToClose(showHelp, () => setShowHelp(false));
+  useBackToClose(micHelp !== null, () => setMicHelp(null));
+  useBackToClose(showInstall, () => setShowInstall(false));
+
+  // Android/desktop Chrome offer a one-tap "install" — keep the event for our button
+  useEffect(() => {
+    const onPrompt = (e) => {
+      e.preventDefault();
+      setInstallPrompt(e);
+    };
+    window.addEventListener("beforeinstallprompt", onPrompt);
+    return () => window.removeEventListener("beforeinstallprompt", onPrompt);
+  }, []);
+  const isStandalone =
+    typeof window !== "undefined" &&
+    (window.matchMedia?.("(display-mode: standalone)").matches || window.navigator.standalone === true);
+  const install = async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    await installPrompt.userChoice.catch(() => {});
+    setInstallPrompt(null);
+    setShowInstall(false);
+  };
+
+  useEffect(() => {
+    if (!chatToast) return;
+    const t = setTimeout(() => setChatToast(null), 7000);
+    return () => clearTimeout(t);
+  }, [chatToast]);
 
   /* ---- voice clue: record → upload → replayable for everyone ---- */
   const canRecord = typeof window !== "undefined" && !!window.MediaRecorder && !!navigator.mediaDevices?.getUserMedia;
@@ -1008,6 +1525,7 @@ export default function App() {
   useEffect(() => {
     setSel(null);
     setErr("");
+    setZoom(null);
     discardRecording();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [core?.phase, core?.round]);
@@ -1050,7 +1568,17 @@ export default function App() {
       // below rather than round-tripped, so sending feels instant.
       .on("broadcast", { event: "chat" }, ({ payload }) => {
         setChatMsgs((m) => [...m.slice(-49), payload]);
-        if (payload.deviceId !== deviceId) setChatUnread((n) => n + 1);
+        if (payload.deviceId === deviceId) return;
+        if (!chatOpenRef.current) setChatUnread((n) => n + 1);
+        if (payload.important) {
+          soundRef.current.alert();
+          try {
+            navigator.vibrate?.([180, 80, 180]);
+          } catch {}
+          setChatToast(payload);
+        } else {
+          soundRef.current.blip();
+        }
       })
       .subscribe();
     channelRef.current = channel;
@@ -1067,7 +1595,12 @@ export default function App() {
     };
   }, [code]);
 
+  // Always lets you out, whatever the phase. The room repairs itself for
+  // whoever stays (see leaveRoom) and your saved seat is forgotten, so
+  // opening the link again lands on the home screen, not back in the room.
   const leave = async () => {
+    const midGame = core && !["lobby", "end"].includes(core.phase);
+    if (midGame && !window.confirm("Leave this game? The others can keep playing without you.")) return;
     if (me && code) {
       await withRoom(code, (s) => applyAction(s, me.id, { type: "leave" }));
     }
@@ -1075,6 +1608,8 @@ export default function App() {
     setMe(null);
     setCode("");
     setCore(null);
+    setChatOpen(false);
+    setChatUnread(0);
     setScreen("home");
   };
 
@@ -1082,10 +1617,11 @@ export default function App() {
     const text = chatIn.trim().slice(0, 200);
     if (!text || !channelRef.current || !me) return;
     sound.unlock();
-    const payload = { id: crypto.randomUUID(), deviceId, name: me.name, text, t: Date.now() };
+    const payload = { id: crypto.randomUUID(), deviceId, name: me.name, text, important: chatImportant, t: Date.now() };
     channelRef.current.send({ type: "broadcast", event: "chat", payload });
     setChatMsgs((m) => [...m.slice(-49), payload]); // own message, echoed locally
     setChatIn("");
+    setChatImportant(false);
   };
 
   const toggleChat = () => {
@@ -1157,7 +1693,10 @@ export default function App() {
     const result = await withRoom(c, (s) => applyAction(s, player.id, { type: "join", name: player.name }));
     setBusy(false);
     if (!result.ok) {
-      return setErr(result.reason === "not-found" ? `No room named ${c}. Check the code with the host.` : "Couldn't join — try again.");
+      if (result.reason === "not-found") return setErr(`No room named ${c}. Check the code with the host.`);
+      if (result.state && result.state.phase !== "lobby")
+        return setErr(`Room ${c} is mid-game. Ask the host to go back to the lobby after this game — or create your own room.`);
+      return setErr("Couldn't join — try again.");
     }
     saveSeat(c, player);
     setMe(player);
@@ -1223,8 +1762,18 @@ export default function App() {
           return s + 1;
         });
       }, 1000);
-    } catch {
-      setErr("Couldn't reach your microphone — check the browser's permission prompt.");
+    } catch (e) {
+      const name = e?.name || "";
+      const reason =
+        name === "NotAllowedError" || name === "SecurityError"
+          ? "Your browser blocked the microphone for this site (or the permission pop-up was dismissed). Here's how to allow it:"
+          : name === "NotFoundError" || name === "OverconstrainedError"
+          ? "No microphone was found on this device. Check one is connected and not switched off."
+          : name === "NotReadableError"
+          ? "The microphone is busy — another app (a call, a voice recorder) may be using it. Close that and try again."
+          : "The microphone couldn't be started. Here's what usually fixes it:";
+      setErr("Microphone not available — see the steps that just opened, or type your clue instead.");
+      setMicHelp(reason);
     }
   };
 
@@ -1271,10 +1820,69 @@ export default function App() {
     background: `radial-gradient(1200px 600px at 50% -10%, ${C.night3} 0%, ${C.night} 60%)`,
     color: C.bone,
     fontFamily: "Inter, system-ui, sans-serif",
-    padding: "20px max(16px, env(safe-area-inset-right)) max(48px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left))",
+    padding:
+      "max(20px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(96px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left))",
     boxSizing: "border-box",
   };
   const display = { fontFamily: "Fraunces, Georgia, serif", fontWeight: 600, letterSpacing: "-0.02em" };
+
+  // open the big card viewer on one card of a row
+  const openZoom = (cards, index, opts = {}) =>
+    setZoom({ items: cards.map((c) => ({ seed: c.card ?? c, url: urlFor(c.card ?? c), label: c.label })), index, ...opts });
+
+  const overlays = (
+    <>
+      {zoom && <Lightbox zoom={zoom} onClose={() => setZoom(null)} />}
+      {micHelp !== null && <MicHelp display={display} reason={micHelp} onClose={() => setMicHelp(null)} />}
+      {showInstall && (
+        <InstallHelp display={display} installPrompt={installPrompt} onInstall={install} onClose={() => setShowInstall(false)} />
+      )}
+      {chatToast && !chatOpen && (
+        <div
+          onClick={() => {
+            setChatToast(null);
+            toggleChat();
+          }}
+          role="button"
+          style={{
+            position: "fixed",
+            top: "max(12px, env(safe-area-inset-top))",
+            left: "50%",
+            transform: "translateX(-50%)",
+            width: "min(92vw, 420px)",
+            zIndex: 55,
+            background: "#3a1c1f",
+            border: "1px solid #e0554f",
+            borderRadius: 12,
+            padding: "12px 14px",
+            boxShadow: "0 12px 40px rgba(0,0,0,.5)",
+            color: C.bone,
+            fontSize: 14,
+            cursor: "pointer",
+            animation: "fabelFade .3s ease",
+          }}
+        >
+          <div style={{ fontSize: 11, letterSpacing: 2, color: "#ff8a84", marginBottom: 4 }}>❗ IMPORTANT · tap to open chat</div>
+          <b style={{ color: C.violet }}>{chatToast.name}</b> {chatToast.text}
+        </div>
+      )}
+    </>
+  );
+
+  const chatPanel = (
+    <ChatPanel
+      open={chatOpen}
+      onToggle={toggleChat}
+      msgs={chatMsgs}
+      myDeviceId={deviceId}
+      chatIn={chatIn}
+      setChatIn={setChatIn}
+      onSend={sendChat}
+      unread={chatUnread}
+      important={chatImportant}
+      setImportant={setChatImportant}
+    />
+  );
 
   if (restoring) {
     return (
@@ -1288,7 +1896,7 @@ export default function App() {
   if (screen === "home") {
     return (
       <div style={page}>
-        <style>{`input::placeholder,textarea::placeholder{color:${C.muted}}`}</style>
+        {overlays}
         <div style={{ maxWidth: 460, margin: "0 auto" }}>
           <div style={{ textAlign: "center", padding: "36px 0 28px" }}>
             <div style={{ width: 92, margin: "0 auto 18px" }}>
@@ -1301,7 +1909,13 @@ export default function App() {
           </div>
 
           <label style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>YOUR NAME</label>
-          <input value={nameIn} onChange={(e) => setNameIn(e.target.value)} placeholder="Bes" style={inp} />
+          <input
+            value={nameIn}
+            onChange={(e) => setNameIn(e.target.value)}
+            placeholder="write your DitFofs name here"
+            maxLength={16}
+            style={inp}
+          />
 
           <div style={{ marginTop: 26 }}>
             <label style={{ fontSize: 12, color: C.muted, fontWeight: 600 }}>JOIN A ROOM</label>
@@ -1373,6 +1987,17 @@ export default function App() {
           </div>
 
           {err && <p style={{ color: C.amber, fontSize: 13, marginTop: 14 }}>{err}</p>}
+
+          {!isStandalone && (
+            <div style={{ marginTop: 34, paddingTop: 18, borderTop: `1px solid ${C.muted}22`, textAlign: "center" }}>
+              <Btn tone="ghost" small onClick={() => setShowInstall(true)}>
+                📲 Put DitFofs on your home screen
+              </Btn>
+              <p style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>
+                Its own icon on your phone — no more digging through WhatsApp for the link.
+              </p>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1433,17 +2058,14 @@ export default function App() {
             <p style={{ color: C.muted, marginTop: 22, fontSize: 14 }}>Waiting for the host to deal…</p>
           )}
           {err && <p style={{ color: C.amber, fontSize: 13, marginTop: 14 }}>{err}</p>}
+          <div style={{ marginTop: 28 }}>
+            <Btn tone="ghost" small onClick={leave}>
+              ← Leave this room
+            </Btn>
+          </div>
         </div>
-        <ChatPanel
-          open={chatOpen}
-          onToggle={toggleChat}
-          msgs={chatMsgs}
-          myDeviceId={deviceId}
-          chatIn={chatIn}
-          setChatIn={setChatIn}
-          onSend={sendChat}
-          unread={chatUnread}
-        />
+        {overlays}
+        {chatPanel}
       </div>
     );
   }
@@ -1454,8 +2076,19 @@ export default function App() {
     return (
       <div style={page}>
         <canvas ref={confettiRef} style={{ position: "fixed", inset: 0, pointerEvents: "none", zIndex: 40 }} />
+        <div style={{ maxWidth: 460, margin: "0 auto" }}>
+          <Header
+            code={core.code}
+            display={display}
+            onLeave={leave}
+            onHelp={() => setShowHelp(true)}
+            soundOn={sound.enabled}
+            onToggleSound={sound.toggle}
+          />
+          {showHelp && <HelpPanel display={display} onClose={() => setShowHelp(false)} />}
+        </div>
         <div className="fabel-fade" style={{ maxWidth: 460, margin: "0 auto", textAlign: "center" }}>
-          <h1 style={{ ...display, fontSize: 40, marginTop: 40 }}>{ranked[0].name} wins</h1>
+          <h1 style={{ ...display, fontSize: 40, marginTop: 30 }}>{ranked[0]?.name} wins</h1>
           <ul style={{ listStyle: "none", padding: 0, marginTop: 24 }}>
             {ranked.map((p, i) => (
               <li key={p.id} style={{ padding: "10px 0", borderBottom: `1px solid ${C.muted}22`, fontSize: 16 }}>
@@ -1464,22 +2097,35 @@ export default function App() {
               </li>
             ))}
           </ul>
-          {isHost && (
-            <div style={{ marginTop: 30 }}>
-              <Btn onClick={() => act("restart")}>Play again</Btn>
+
+          {isHost ? (
+            <div style={{ marginTop: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
+              <Btn onClick={() => act("restart")} disabled={core.players.length < 3}>
+                Play again, same table
+              </Btn>
+              <Btn tone="dark" onClick={() => act("lobby")}>
+                Back to the lobby (people can join or leave)
+              </Btn>
+              {core.players.length < 3 && (
+                <p style={{ fontSize: 13, color: C.muted }}>Fewer than 3 players left — go back to the lobby to wait for more.</p>
+              )}
             </div>
+          ) : (
+            <p style={{ marginTop: 28, fontSize: 14, color: C.muted, lineHeight: 1.6 }}>
+              {core.players.find((p) => p.id === core.hostId)?.name || "The host"} can start another game. Not staying?
+              You're free to go any time.
+            </p>
           )}
+
+          <div style={{ marginTop: 18, display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
+            <Btn tone="ghost" onClick={leave}>
+              Leave — go back to start
+            </Btn>
+            <span style={{ fontSize: 12, color: C.muted }}>From there you can create your own room or join another.</span>
+          </div>
         </div>
-        <ChatPanel
-          open={chatOpen}
-          onToggle={toggleChat}
-          msgs={chatMsgs}
-          myDeviceId={deviceId}
-          chatIn={chatIn}
-          setChatIn={setChatIn}
-          onSend={sendChat}
-          unread={chatUnread}
-        />
+        {overlays}
+        {chatPanel}
       </div>
     );
   }
@@ -1557,8 +2203,15 @@ export default function App() {
         {core.phase === "clue" && iAmSt && (
           <>
             <Row label="Choose one card, then write your clue">
-              {myHand.map((c) => (
-                <Card key={c} seed={c} url={urlFor(c)} selected={sel === c} onClick={() => setSel(c)} />
+              {myHand.map((c, i) => (
+                <Card
+                  key={c}
+                  seed={c}
+                  url={urlFor(c)}
+                  selected={sel === c}
+                  onClick={() => setSel(c)}
+                  onZoom={() => openZoom(myHand, i, { onPick: (it) => setSel(it.seed) })}
+                />
               ))}
             </Row>
             <div style={{ display: "flex", gap: 8, marginTop: 18, flexWrap: "wrap" }}>
@@ -1573,15 +2226,31 @@ export default function App() {
               </Btn>
             </div>
 
+            {!canRecord && (
+              <p style={{ marginTop: 12, fontSize: 13, color: C.muted }}>
+                🎤 Voice clues aren't available in this browser.{" "}
+                <button
+                  onClick={() => setMicHelp("This browser can't record audio. Opening the link in Chrome or Safari usually fixes it:")}
+                  style={{ ...linkBtnStyle, marginLeft: 0, padding: 0, fontSize: 13 }}
+                >
+                  Why, and how to fix it
+                </button>
+              </p>
+            )}
             {canRecord && (
               <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                 {recState === "idle" && (
-                  <button
-                    onClick={startRecording}
-                    style={{ ...linkBtnStyle, marginLeft: 0, textDecoration: "none", fontSize: 13 }}
-                  >
-                    🎤 or record a voice clue instead
-                  </button>
+                  <>
+                    <button
+                      onClick={startRecording}
+                      style={{ ...linkBtnStyle, marginLeft: 0, textDecoration: "none", fontSize: 13 }}
+                    >
+                      🎤 or record a voice clue instead
+                    </button>
+                    <button onClick={() => setMicHelp("")} style={{ ...linkBtnStyle, marginLeft: 0, fontSize: 12 }}>
+                      mic not working?
+                    </button>
+                  </>
                 )}
                 {recState === "recording" && (
                   <>
@@ -1609,8 +2278,8 @@ export default function App() {
         )}
         {core.phase === "clue" && !iAmSt && (
           <Row label="Your hand">
-            {myHand.map((c) => (
-              <Card key={c} seed={c} url={urlFor(c)} />
+            {myHand.map((c, i) => (
+              <Card key={c} seed={c} url={urlFor(c)} onZoom={() => openZoom(myHand, i)} />
             ))}
           </Row>
         )}
@@ -1620,8 +2289,15 @@ export default function App() {
             {!iAmSt && !iSubmitted && (
               <>
                 <Row label="Your hand">
-                  {myHand.map((c) => (
-                    <Card key={c} seed={c} url={urlFor(c)} selected={sel === c} onClick={() => setSel(c)} />
+                  {myHand.map((c, i) => (
+                    <Card
+                      key={c}
+                      seed={c}
+                      url={urlFor(c)}
+                      selected={sel === c}
+                      onClick={() => setSel(c)}
+                      onZoom={() => openZoom(myHand, i, { onPick: (it) => setSel(it.seed) })}
+                    />
                   ))}
                 </Row>
                 <div style={{ marginTop: 18 }}>
@@ -1656,6 +2332,19 @@ export default function App() {
                     selected={sel === s.card}
                     badge={mine ? "yours" : undefined}
                     onClick={!iAmSt && !iVoted && !mine ? () => setSel(s.card) : undefined}
+                    onZoom={() =>
+                      openZoom(
+                        core.submissions.map((x) => ({ card: x.card, label: x.playerId === me.id ? "yours" : undefined })),
+                        i,
+                        !iAmSt && !iVoted
+                          ? {
+                              onPick: (it) => setSel(it.seed),
+                              canPick: (it) => it.label !== "yours",
+                              pickLabel: "Pick this one",
+                            }
+                          : {}
+                      )
+                    }
                   />
                 );
               })}
@@ -1691,7 +2380,22 @@ export default function App() {
                       className={isSt ? "fabel-pulse" : undefined}
                       style={{ outline: isSt ? `3px solid ${C.violet}` : "none", borderRadius: 12 }}
                     >
-                      <Card seed={s.card} url={urlFor(s.card)} width="100%" flip flipDelay={i * 90} />
+                      <Card
+                        seed={s.card}
+                        url={urlFor(s.card)}
+                        width="100%"
+                        flip
+                        flipDelay={i * 90}
+                        onZoom={() =>
+                          openZoom(
+                            core.submissions.map((x) => ({
+                              card: x.card,
+                              label: `${core.players.find((p) => p.id === x.playerId)?.name || ""}${x.card === core.result.stCard ? " ✦" : ""}`,
+                            })),
+                            i
+                          )
+                        }
+                      />
                     </div>
                     <div style={{ marginTop: 8, fontSize: 12, lineHeight: 1.5 }}>
                       <div style={{ color: isSt ? C.violet : C.bone, fontWeight: 600 }}>
@@ -1727,16 +2431,8 @@ export default function App() {
         )}
         </div>
       </div>
-      <ChatPanel
-        open={chatOpen}
-        onToggle={toggleChat}
-        msgs={chatMsgs}
-        myDeviceId={deviceId}
-        chatIn={chatIn}
-        setChatIn={setChatIn}
-        onSend={sendChat}
-        unread={chatUnread}
-      />
+      {overlays}
+      {chatPanel}
     </div>
   );
 }
