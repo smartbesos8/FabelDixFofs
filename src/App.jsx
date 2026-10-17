@@ -496,6 +496,11 @@ function useGlobalStyles() {
       :root { --hand-w: 132px; --table-w: 150px; }
       .fabel-row { display: flex; gap: 12px; flex-wrap: wrap; padding-bottom: 10px; }
       .fabel-swipe-hint { display: none; }
+      /* big card in the viewer: as large as fits between the top bar and the
+         pinned action button. svh = the *visible* height on phones (address
+         bar included); the vh line is a fallback for older browsers. */
+      .fabel-zoom-card { width: min(84vw, calc((100vh - 220px) * 5 / 7), 460px); }
+      @supports (height: 100svh) { .fabel-zoom-card { width: min(84vw, calc((100svh - 190px) * 5 / 7), 460px); } }
       @media (max-width: 640px) {
         :root { --hand-w: 46vw; --table-w: 62vw; }
         .fabel-row {
@@ -901,13 +906,44 @@ function Lightbox({ zoom, onClose }) {
   }, [n]);
   const item = zoom.items[i];
   const canPick = zoom.onPick && (!zoom.canPick || zoom.canPick(item));
-  const arrow = { ...closeXStyle, fontSize: 34, color: C.bone, padding: "8px 12px" };
+  const arrow = {
+    ...closeXStyle,
+    position: "absolute",
+    top: "50%",
+    transform: "translateY(-50%)",
+    zIndex: 1,
+    width: 44,
+    height: 64,
+    padding: 0,
+    fontSize: 34,
+    color: C.bone,
+    background: "rgba(6,14,18,.55)",
+    borderRadius: 10,
+  };
 
   return (
-    <div onClick={onClose} style={{ ...overlayStyle, flexDirection: "column", gap: 14 }}>
-      <button onClick={onClose} aria-label="Close" style={{ ...closeXStyle, position: "absolute", top: 10, right: 10, color: C.bone, fontSize: 32 }}>
-        ✕
-      </button>
+    <div
+      onClick={onClose}
+      style={{
+        ...overlayStyle,
+        flexDirection: "column",
+        justifyContent: "flex-start",
+        padding: "max(8px, env(safe-area-inset-top)) 8px 0",
+        gap: 8,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: "100%", maxWidth: 560, display: "flex", alignItems: "center", justifyContent: "space-between", color: C.muted, fontSize: 13 }}
+      >
+        <span style={{ paddingLeft: 8 }}>
+          {n > 1 && `${i + 1} / ${n}`}
+          {item.label && <span style={{ color: C.bone, marginLeft: 10 }}>{item.label}</span>}
+        </span>
+        <button onClick={onClose} aria-label="Close" style={{ ...closeXStyle, color: C.bone, fontSize: 30 }}>
+          ✕
+        </button>
+      </div>
       <div
         onClick={(e) => e.stopPropagation()}
         onTouchStart={(e) => (touchX.current = e.touches[0].clientX)}
@@ -917,16 +953,16 @@ function Lightbox({ zoom, onClose }) {
           if (Math.abs(dx) > 40) go(dx < 0 ? 1 : -1);
           touchX.current = null;
         }}
-        style={{ display: "flex", alignItems: "center", gap: 6 }}
+        style={{ position: "relative" }}
       >
         {n > 1 && (
-          <button onClick={() => go(-1)} aria-label="Previous card" style={arrow}>
+          <button onClick={() => go(-1)} aria-label="Previous card" style={{ ...arrow, left: 4 }}>
             ‹
           </button>
         )}
         <div
+          className="fabel-zoom-card"
           style={{
-            width: "min(78vw, calc(74vh * 5 / 7), 460px)",
             aspectRatio: "5 / 7",
             borderRadius: 14,
             overflow: "hidden",
@@ -937,25 +973,41 @@ function Lightbox({ zoom, onClose }) {
           <CardArt seed={item.seed} url={item.url} />
         </div>
         {n > 1 && (
-          <button onClick={() => go(1)} aria-label="Next card" style={arrow}>
+          <button onClick={() => go(1)} aria-label="Next card" style={{ ...arrow, right: 4 }}>
             ›
           </button>
         )}
       </div>
-      <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", alignItems: "center", gap: 14, color: C.muted, fontSize: 13 }}>
-        {n > 1 && <span>{i + 1} / {n}</span>}
-        {item.label && <span style={{ color: C.bone }}>{item.label}</span>}
-        {canPick && (
-          <Btn
-            onClick={() => {
-              zoom.onPick(item);
-              onClose();
-            }}
-          >
-            {zoom.pickLabel || "Choose this card"}
-          </Btn>
-        )}
-      </div>
+      {/* Action bar pinned to the bottom of the screen, so it's always
+          reachable even when the phone's address bar eats into the height. */}
+      {zoom.onPick && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "fixed",
+            left: 0,
+            right: 0,
+            bottom: 0,
+            padding: "12px 16px max(14px, env(safe-area-inset-bottom))",
+            background: "linear-gradient(transparent, rgba(6,14,18,.96) 30%)",
+            display: "flex",
+            justifyContent: "center",
+          }}
+        >
+          {canPick ? (
+            <Btn
+              onClick={() => {
+                zoom.onPick(item);
+                onClose();
+              }}
+            >
+              {zoom.pickLabel || "Choose this card"}
+            </Btn>
+          ) : (
+            <span style={{ color: C.muted, fontSize: 13, padding: "12px 0" }}>{zoom.cantPickNote || "You can't pick this one"}</span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1501,6 +1553,7 @@ export default function App() {
   const mediaRecorderRef = useRef(null);
   const recChunksRef = useRef([]);
   const recTimerRef = useRef(null);
+  const clueInputRef = useRef(null);
 
   /* ---- a soft chime on reveal, a small flourish on the win screen ---- */
   useEffect(() => {
@@ -2210,12 +2263,21 @@ export default function App() {
                   url={urlFor(c)}
                   selected={sel === c}
                   onClick={() => setSel(c)}
-                  onZoom={() => openZoom(myHand, i, { onPick: (it) => setSel(it.seed) })}
+                  onZoom={() =>
+                    openZoom(myHand, i, {
+                      onPick: (it) => {
+                        setSel(it.seed);
+                        setTimeout(() => clueInputRef.current?.focus(), 150);
+                      },
+                      pickLabel: "Use this card for my clue",
+                    })
+                  }
                 />
               ))}
             </Row>
             <div style={{ display: "flex", gap: 8, marginTop: 18, flexWrap: "wrap" }}>
               <input
+                ref={clueInputRef}
                 value={clueIn}
                 onChange={(e) => setClueIn(e.target.value)}
                 placeholder="a word, a phrase, a sound…"
@@ -2296,7 +2358,15 @@ export default function App() {
                       url={urlFor(c)}
                       selected={sel === c}
                       onClick={() => setSel(c)}
-                      onZoom={() => openZoom(myHand, i, { onPick: (it) => setSel(it.seed) })}
+                      onZoom={() =>
+                        openZoom(myHand, i, {
+                          onPick: (it) => {
+                            setSel(it.seed);
+                            act("submit", { card: it.seed });
+                          },
+                          pickLabel: "Play this card face down",
+                        })
+                      }
                     />
                   ))}
                 </Row>
@@ -2338,9 +2408,13 @@ export default function App() {
                         i,
                         !iAmSt && !iVoted
                           ? {
-                              onPick: (it) => setSel(it.seed),
+                              onPick: (it) => {
+                                setSel(it.seed);
+                                act("vote", { card: it.seed });
+                              },
                               canPick: (it) => it.label !== "yours",
-                              pickLabel: "Pick this one",
+                              pickLabel: "Vote for this one",
+                              cantPickNote: "That's your own card — swipe to another one",
                             }
                           : {}
                       )
