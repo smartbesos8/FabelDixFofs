@@ -59,6 +59,14 @@ function clearSeat() {
 }
 
 /* ---------- utils ---------- */
+// Opens Google Translate (website, or the app if installed) with the clue
+// filled in, auto-detecting its language and translating into the
+// player's own phone/browser language. Free, no API key involved.
+function translateUrl(text) {
+  const lang = (typeof navigator !== "undefined" && (navigator.language || "en").split("-")[0]) || "en";
+  return `https://translate.google.com/?sl=auto&tl=${encodeURIComponent(lang)}&text=${encodeURIComponent(text)}&op=translate`;
+}
+
 const mulberry32 = (a) => () => {
   a |= 0;
   a = (a + 0x6d2b79f5) | 0;
@@ -2238,6 +2246,24 @@ export default function App() {
                   {core.clue}
                   <span style={{ color: C.amber, opacity: 0.6 }}>”</span>
                 </div>
+              )}
+              {core.clue && (
+                <a
+                  href={translateUrl(core.clue)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{
+                    display: "inline-block",
+                    marginTop: 8,
+                    padding: "6px 10px",
+                    fontSize: 13,
+                    color: C.muted,
+                    textDecoration: "underline",
+                    touchAction: "manipulation",
+                  }}
+                >
+                  🌐 Translate this clue
+                </a>
               )}
               {core.clueAudioUrl && (
                 <audio
