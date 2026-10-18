@@ -521,11 +521,16 @@ function useGlobalStyles() {
       * { -webkit-tap-highlight-color: transparent; }
       input::placeholder, textarea::placeholder { color: ${C.muted}; font-weight: 400; font-style: italic; opacity: .75; letter-spacing: normal; }
 
-      /* Card sizes: desktop rows wrap; on phones cards get much bigger and
-         the row becomes a sideways swipe, snapping card by card. */
-      :root { --hand-w: 132px; --table-w: 150px; }
+      /* Card sizes. Laptop/desktop: grow with the window (capped by its
+         height too, so a row still fits on a short laptop screen), rows wrap.
+         Phones: either a sideways swipe of big cards, or — the "all cards"
+         view — every card at once in a grid. */
+      :root {
+        --hand-w: clamp(132px, min(14.5vw, 26vh), 200px);
+        --table-w: clamp(150px, min(19vw, 36vh), 260px);
+      }
       .fabel-row { display: flex; gap: 12px; flex-wrap: wrap; padding-bottom: 10px; }
-      .fabel-swipe-hint { display: none; }
+      .fabel-swipe-hint, .fabel-mobile-only { display: none; }
       /* big card in the viewer: as large as fits between the top bar and the
          pinned action button. svh = the *visible* height on phones (address
          bar included); the vh line is a fallback for older browsers. */
@@ -541,6 +546,15 @@ function useGlobalStyles() {
         .fabel-row::-webkit-scrollbar { display: none; }
         .fabel-row > * { scroll-snap-align: center; }
         .fabel-swipe-hint { display: block; }
+        .fabel-mobile-only { display: inline-flex; }
+
+        /* "All cards" view: hand in 3 columns (all 6 on screen), table in 2 */
+        .fabel-layout-grid { --hand-w: calc((100vw - 32px - 16px) / 3); --table-w: calc((100vw - 32px - 8px) / 2); }
+        .fabel-layout-grid .fabel-row {
+          flex-wrap: wrap; overflow-x: visible; scroll-snap-type: none;
+          gap: 8px; padding: 4px 0 10px; margin: 0;
+        }
+        .fabel-layout-grid .fabel-swipe-hint { display: none; }
       }
       @keyframes fabelFade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
       .fabel-fade { animation: fabelFade .38s ease; }
@@ -1437,10 +1451,48 @@ function ChatPanel({ open, onToggle, msgs, myDeviceId, chatIn, setChatIn, onSend
   );
 }
 
+/* Phone-only card view preference ("swipe" | "grid"), shared by every row. */
+const LayoutContext = React.createContext({ layout: "swipe", setLayout: () => {} });
+
+function LayoutToggle() {
+  const { layout, setLayout } = React.useContext(LayoutContext);
+  const seg = (value, text) => (
+    <button
+      onClick={() => setLayout(value)}
+      aria-pressed={layout === value}
+      style={{
+        border: "none",
+        padding: "6px 10px",
+        fontSize: 12,
+        fontFamily: "Inter, system-ui, sans-serif",
+        cursor: "pointer",
+        background: layout === value ? C.amber : "transparent",
+        color: layout === value ? C.night : C.muted,
+        fontWeight: layout === value ? 600 : 400,
+        touchAction: "manipulation",
+      }}
+    >
+      {text}
+    </button>
+  );
+  return (
+    <span
+      className="fabel-mobile-only"
+      style={{ borderRadius: 999, overflow: "hidden", boxShadow: `inset 0 0 0 1px ${C.muted}55`, flex: "0 0 auto" }}
+    >
+      {seg("swipe", "⇆ Swipe")}
+      {seg("grid", "▦ All cards")}
+    </span>
+  );
+}
+
 function Row({ label, children }) {
   return (
     <div>
-      {label && <div style={{ fontSize: 11, letterSpacing: 2, color: C.muted, marginBottom: 10 }}>{label.toUpperCase()}</div>}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10, minHeight: 20 }}>
+        <span style={{ fontSize: 11, letterSpacing: 2, color: C.muted }}>{label ? label.toUpperCase() : ""}</span>
+        <LayoutToggle />
+      </div>
       <div className="fabel-row">{children}</div>
       <div className="fabel-swipe-hint" style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
         ← swipe to see all cards · tap 🔍 to look closer →
@@ -1585,6 +1637,19 @@ export default function App() {
   const recTimerRef = useRef(null);
   const clueInputRef = useRef(null);
   const [clueTr, setClueTr] = useState(null); // { for: clueText, text?, from?, loading?, failed? }
+  const [cardLayout, setCardLayoutState] = useState(() => {
+    try {
+      return localStorage.getItem("fabel:cardLayout") === "grid" ? "grid" : "swipe";
+    } catch {
+      return "swipe";
+    }
+  });
+  const setCardLayout = (v) => {
+    setCardLayoutState(v);
+    try {
+      localStorage.setItem("fabel:cardLayout", v);
+    } catch {}
+  };
 
   /* ---- a soft chime on reveal, a small flourish on the win screen ---- */
   useEffect(() => {
@@ -2226,8 +2291,9 @@ export default function App() {
   const iVoted = core.votes[me.id] !== undefined;
 
   return (
-    <div style={page}>
-      <div style={{ maxWidth: 900, margin: "0 auto" }}>
+    <LayoutContext.Provider value={{ layout: cardLayout, setLayout: setCardLayout }}>
+    <div style={page} className={cardLayout === "grid" ? "fabel-layout-grid" : undefined}>
+      <div style={{ maxWidth: 1280, margin: "0 auto" }}>
         <Header
           code={core.code}
           display={display}
@@ -2578,5 +2644,6 @@ export default function App() {
       {overlays}
       {chatPanel}
     </div>
+    </LayoutContext.Provider>
   );
 }
