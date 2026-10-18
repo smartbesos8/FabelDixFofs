@@ -661,7 +661,71 @@ function useSound() {
     });
   }, []);
 
-  return { enabled, toggle, chime, flourish, blip, alert, unlock: ensureCtx };
+  // "your move" — a bright rising call, clearly different from chat sounds
+  const yourTurn = useCallback(() => {
+    [659.25, 880, 1174.66].forEach((f, i) => tone(f, i * 0.13, 0.42, 0.075, "triangle"));
+  }, [tone]);
+
+  return { enabled, toggle, chime, flourish, blip, alert, yourTurn, unlock: ensureCtx };
+}
+
+/* ---------- voice notes: record a short clip, upload it, get a URL ---------- */
+async function uploadAudio(blob, path) {
+  const ext = blob.type.includes("mp4") ? "m4a" : blob.type.includes("ogg") ? "ogg" : "webm";
+  const full = `${path}.${ext}`;
+  const { error } = await supabase.storage.from("clue-audio").upload(full, blob, { contentType: blob.type });
+  if (error) throw error;
+  return supabase.storage.from("clue-audio").getPublicUrl(full).data.publicUrl;
+}
+
+/* Tap-to-start / tap-to-stop recorder, WhatsApp style. `onDone(blob)` fires
+   when recording stops (or hits maxSecs); cancel() throws the clip away. */
+function useRecorder(maxSecs, onDone, onError) {
+  const [recording, setRecording] = useState(false);
+  const [secs, setSecs] = useState(0);
+  const recRef = useRef(null);
+  const timerRef = useRef(null);
+  const cancelledRef = useRef(false);
+  const doneRef = useRef(onDone);
+  doneRef.current = onDone;
+
+  const stop = () => {
+    clearInterval(timerRef.current);
+    if (recRef.current?.state === "recording") recRef.current.stop();
+  };
+  const cancel = () => {
+    cancelledRef.current = true;
+    stop();
+  };
+  const start = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mime = ["audio/webm", "audio/mp4", "audio/ogg"].find((t) => window.MediaRecorder.isTypeSupported?.(t));
+      const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      const chunks = [];
+      cancelledRef.current = false;
+      rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+      rec.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        setRecording(false);
+        if (!cancelledRef.current && chunks.length) doneRef.current(new Blob(chunks, { type: rec.mimeType || "audio/webm" }));
+      };
+      recRef.current = rec;
+      rec.start();
+      setRecording(true);
+      setSecs(0);
+      timerRef.current = setInterval(() => {
+        setSecs((s) => {
+          if (s + 1 >= maxSecs) stop();
+          return s + 1;
+        });
+      }, 1000);
+    } catch (e) {
+      onError?.(e);
+    }
+  };
+  useEffect(() => () => cancel(), []); // stop the mic if the panel unmounts mid-recording
+  return { recording, secs, start, stop, cancel };
 }
 
 /* ---------- a light canvas confetti burst for the win screen ---------- */
@@ -1291,7 +1355,8 @@ function HelpPanel({ onClose, display }) {
         <ul style={{ paddingLeft: 18, marginTop: 12, fontSize: 12, color: C.muted, lineHeight: 1.7 }}>
           <li>🔍 on a card opens it big — swipe or use the arrows to look through the rest.</li>
           <li>🎤 As the teller you can record your clue instead of typing it. Tap “mic not working?” if your browser blocks it.</li>
-          <li>💬 Chat with the table any time; tap ❗ before sending to make it ring loudly for everyone.</li>
+          <li>💬 Chat with the table any time; tap ❗ before sending to make it ring loudly for everyone. With the text box empty, 🎤 records a voice message (tap ➤ to send, ✕ to throw it away).</li>
+          <li>🔔 When it's your move (the teller has spoken, voting starts, or it's your turn to tell) you'll hear a call and see a banner.</li>
           <li>LEAVE (top right) always lets you out — the game carries on for the others.</li>
         </ul>
       </div>
@@ -1302,11 +1367,42 @@ function HelpPanel({ onClose, display }) {
 /* Floating table chat — ephemeral (nothing persisted), relayed live over
    Supabase Realtime broadcast. A round badge on the toggle shows unread
    count while closed. */
-function ChatPanel({ open, onToggle, msgs, myDeviceId, chatIn, setChatIn, onSend, unread, important, setImportant }) {
+function ChatPanel({
+  open,
+  onToggle,
+  msgs,
+  myDeviceId,
+  chatIn,
+  setChatIn,
+  onSend,
+  unread,
+  important,
+  setImportant,
+  onSendVoice,
+  onMicError,
+  voiceBusy,
+}) {
   const listRef = useRef(null);
   useEffect(() => {
     if (open && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [open, msgs.length]);
+  const canRecordVoice = typeof window !== "undefined" && !!window.MediaRecorder && !!navigator.mediaDevices?.getUserMedia;
+  const rec = useRecorder(30, onSendVoice, onMicError);
+  useEffect(() => {
+    if (!open && rec.recording) rec.cancel(); // closing the chat throws away an unfinished voice note
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+  const roundBtn = (extra) => ({
+    flex: "0 0 auto",
+    width: 40,
+    height: 40,
+    borderRadius: "50%",
+    border: "none",
+    fontSize: 17,
+    cursor: "pointer",
+    touchAction: "manipulation",
+    ...extra,
+  });
 
   return (
     <div
@@ -1367,10 +1463,34 @@ function ChatPanel({ open, onToggle, msgs, myDeviceId, chatIn, setChatIn, onSend
               >
                 {m.important && <span style={{ color: "#ff8a84", fontWeight: 700 }}>❗ </span>}
                 <b style={{ color: m.deviceId === myDeviceId ? C.amber : C.violet }}>{m.name}</b>{" "}
-                <span style={{ color: C.bone }}>{m.text}</span>
+                {m.audioUrl ? (
+                  <audio controls preload="metadata" src={m.audioUrl} style={{ display: "block", width: "100%", height: 34, marginTop: 4 }} />
+                ) : (
+                  <span style={{ color: C.bone }}>{m.text}</span>
+                )}
               </div>
             ))}
           </div>
+          {rec.recording || voiceBusy ? (
+            <div style={{ display: "flex", gap: 8, padding: 10, borderTop: `1px solid ${C.muted}22`, alignItems: "center" }}>
+              {voiceBusy ? (
+                <span style={{ flex: 1, fontSize: 13, color: C.muted }}>Sending voice message…</span>
+              ) : (
+                <>
+                  <button onClick={rec.cancel} aria-label="Cancel voice message" title="Throw away" style={roundBtn({ background: "transparent", color: C.muted, boxShadow: `inset 0 0 0 1px ${C.muted}55` })}>
+                    ✕
+                  </button>
+                  <span style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: C.bone }}>
+                    <span className="fabel-pulse" style={{ width: 10, height: 10, borderRadius: "50%", background: "#e0554f", display: "inline-block" }} />
+                    Recording… 0:{String(rec.secs).padStart(2, "0")} / 0:30
+                  </span>
+                  <button onClick={rec.stop} aria-label="Send voice message" title="Send" style={roundBtn({ background: C.amber, color: C.night })}>
+                    ➤
+                  </button>
+                </>
+              )}
+            </div>
+          ) : (
           <div style={{ display: "flex", gap: 6, padding: 10, borderTop: `1px solid ${C.muted}22`, alignItems: "center" }}>
             <button
               onClick={() => setImportant(!important)}
@@ -1399,10 +1519,22 @@ function ChatPanel({ open, onToggle, msgs, myDeviceId, chatIn, setChatIn, onSend
               placeholder={important ? "Important message…" : "Say something…"}
               style={{ ...inp, marginTop: 0, padding: "8px 10px" }}
             />
-            <Btn small disabled={!chatIn.trim()} onClick={onSend}>
-              Send
-            </Btn>
+            {chatIn.trim() || !canRecordVoice ? (
+              <Btn small disabled={!chatIn.trim()} onClick={onSend}>
+                Send
+              </Btn>
+            ) : (
+              <button
+                onClick={rec.start}
+                aria-label="Record a voice message"
+                title="Record a voice message (tap, talk, tap ➤ to send)"
+                style={roundBtn({ background: C.night3, color: C.bone })}
+              >
+                🎤
+              </button>
+            )}
           </div>
+          )}
         </div>
       )}
       <button
@@ -1651,16 +1783,60 @@ export default function App() {
     } catch {}
   };
 
-  /* ---- a soft chime on reveal, a small flourish on the win screen ---- */
+  /* ---- sounds on phase changes, plus a "your turn" alert whenever the
+     game is now waiting on *you* (so nobody misses that the teller has
+     spoken). Keyed on phase+round so it never fires on first load. ---- */
+  const [turnAlert, setTurnAlert] = useState(null); // { key, title, body }
+  const showTurnRef = useRef(false); // is the alert still relevant (move not made yet)? set during render below
   useEffect(() => {
     const phase = core?.phase;
+    const key = phase ? `${phase}-${core.round}` : null;
     const prev = prevPhaseRef.current;
-    if (phase && prev && phase !== prev) {
+    if (key && prev && key !== prev) {
       if (phase === "reveal") sound.chime();
       if (phase === "end") sound.flourish();
+
+      const teller = core.players[core.storytellerIdx];
+      const amIn = me && core.players.some((p) => p.id === me.id);
+      const iTell = amIn && teller?.id === me.id;
+      let alert = null;
+      if (amIn && phase === "clue" && iTell) alert = { title: "Your turn to tell!", body: "Pick a card and give a clue." };
+      if (amIn && phase === "submit" && !iTell)
+        alert = {
+          title: `${teller?.name || "The teller"} has told a clue`,
+          body: core.clue ? `“${core.clue}” — now pick a card from your hand that fits.` : "🎤 It's a voice clue — listen, then pick a card that fits.",
+        };
+      if (amIn && phase === "vote" && !iTell) alert = { title: "Time to vote!", body: "All cards are on the table — which one is the teller's?" };
+      if (alert) {
+        setTurnAlert({ key, ...alert });
+        sound.yourTurn();
+        try {
+          navigator.vibrate?.([120, 60, 120]);
+        } catch {}
+      } else setTurnAlert(null);
     }
-    prevPhaseRef.current = phase || null;
-  }, [core?.phase, sound]);
+    prevPhaseRef.current = key;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [core?.phase, core?.round]);
+
+  // If you're in another tab/window, flash the tab title until you come back
+  useEffect(() => {
+    if (!turnAlert) return;
+    const base = "DitFofs";
+    let on = false;
+    const tick = setInterval(() => {
+      if (!showTurnRef.current || (!document.hidden && document.hasFocus())) {
+        document.title = base;
+        return;
+      }
+      on = !on;
+      document.title = on ? "🔔 Your turn! · DitFofs" : base;
+    }, 1000);
+    return () => {
+      clearInterval(tick);
+      document.title = base;
+    };
+  }, [turnAlert]);
 
   useEffect(() => {
     phaseStartRef.current = Date.now();
@@ -1771,6 +1947,37 @@ export default function App() {
     setChatMsgs((m) => [...m.slice(-49), payload]); // own message, echoed locally
     setChatIn("");
     setChatImportant(false);
+  };
+
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const sendVoice = async (blob) => {
+    if (!channelRef.current || !me) return;
+    setVoiceBusy(true);
+    try {
+      const audioUrl = await uploadAudio(blob, `chat/${code}/${crypto.randomUUID()}`);
+      const payload = { id: crypto.randomUUID(), deviceId, name: me.name, audioUrl, important: chatImportant, t: Date.now() };
+      channelRef.current.send({ type: "broadcast", event: "chat", payload });
+      setChatMsgs((m) => [...m.slice(-49), payload]);
+      setChatImportant(false);
+    } catch {
+      setChatMsgs((m) => [
+        ...m.slice(-49),
+        { id: crypto.randomUUID(), deviceId: "system", name: "DitFofs", text: "That voice message didn't send — check your connection and try again." },
+      ]);
+    }
+    setVoiceBusy(false);
+  };
+  const onChatMicError = (e) => {
+    const name = e?.name || "";
+    setMicHelp(
+      name === "NotAllowedError" || name === "SecurityError"
+        ? "Your browser blocked the microphone for this site. Here's how to allow it:"
+        : name === "NotFoundError"
+        ? "No microphone was found on this device."
+        : name === "NotReadableError"
+        ? "The microphone is busy — another app may be using it."
+        : "The microphone couldn't be started. Here's what usually fixes it:"
+    );
   };
 
   const toggleChat = () => {
@@ -1979,6 +2186,18 @@ export default function App() {
   const openZoom = (cards, index, opts = {}) =>
     setZoom({ items: cards.map((c) => ({ seed: c.card ?? c, url: urlFor(c.card ?? c), label: c.label })), index, ...opts });
 
+  // the "your move" banner stays until dismissed or until you've made the move
+  const tellerNow = core?.players?.[core.storytellerIdx];
+  const showTurnAlert =
+    !!turnAlert &&
+    !!core &&
+    !!me &&
+    turnAlert.key === `${core.phase}-${core.round}` &&
+    ((core.phase === "clue" && tellerNow?.id === me.id) ||
+      (core.phase === "submit" && tellerNow?.id !== me.id && !core.submissions.some((s) => s.playerId === me.id)) ||
+      (core.phase === "vote" && tellerNow?.id !== me.id && core.votes[me.id] === undefined));
+  showTurnRef.current = showTurnAlert;
+
   const overlays = (
     <>
       {zoom && <Lightbox zoom={zoom} onClose={() => setZoom(null)} />}
@@ -1986,35 +2205,72 @@ export default function App() {
       {showInstall && (
         <InstallHelp display={display} installPrompt={installPrompt} onInstall={install} onClose={() => setShowInstall(false)} />
       )}
-      {chatToast && !chatOpen && (
-        <div
-          onClick={() => {
-            setChatToast(null);
-            toggleChat();
-          }}
-          role="button"
-          style={{
-            position: "fixed",
-            top: "max(12px, env(safe-area-inset-top))",
-            left: "50%",
-            transform: "translateX(-50%)",
-            width: "min(92vw, 420px)",
-            zIndex: 55,
-            background: "#3a1c1f",
-            border: "1px solid #e0554f",
-            borderRadius: 12,
-            padding: "12px 14px",
-            boxShadow: "0 12px 40px rgba(0,0,0,.5)",
-            color: C.bone,
-            fontSize: 14,
-            cursor: "pointer",
-            animation: "fabelFade .3s ease",
-          }}
-        >
-          <div style={{ fontSize: 11, letterSpacing: 2, color: "#ff8a84", marginBottom: 4 }}>❗ IMPORTANT · tap to open chat</div>
-          <b style={{ color: C.violet }}>{chatToast.name}</b> {chatToast.text}
-        </div>
-      )}
+      <div
+        style={{
+          position: "fixed",
+          top: "max(12px, env(safe-area-inset-top))",
+          left: "50%",
+          transform: "translateX(-50%)",
+          width: "min(92vw, 440px)",
+          zIndex: 55,
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+          pointerEvents: "none",
+        }}
+      >
+        {showTurnAlert && (
+          <div
+            role="alert"
+            style={{
+              pointerEvents: "auto",
+              position: "relative",
+              background: C.night2,
+              border: `2px solid ${C.amber}`,
+              borderRadius: 14,
+              padding: "14px 44px 14px 16px",
+              boxShadow: `0 14px 44px rgba(0,0,0,.6), 0 0 0 4px ${C.amber}22`,
+              color: C.bone,
+              animation: "fabelFade .3s ease",
+            }}
+          >
+            <div style={{ fontSize: 11, letterSpacing: 2, color: C.amber, marginBottom: 4 }}>🔔 YOUR MOVE</div>
+            <div style={{ fontFamily: "Fraunces, Georgia, serif", fontWeight: 600, fontSize: 19 }}>{turnAlert.title}</div>
+            <div style={{ fontSize: 14, color: C.bone, opacity: 0.9, marginTop: 4, lineHeight: 1.45 }}>{turnAlert.body}</div>
+            <button
+              onClick={() => setTurnAlert(null)}
+              aria-label="Dismiss"
+              style={{ ...closeXStyle, position: "absolute", top: 6, right: 6, color: C.bone }}
+            >
+              ✕
+            </button>
+          </div>
+        )}
+        {chatToast && !chatOpen && (
+          <div
+            onClick={() => {
+              setChatToast(null);
+              toggleChat();
+            }}
+            role="button"
+            style={{
+              pointerEvents: "auto",
+              background: "#3a1c1f",
+              border: "1px solid #e0554f",
+              borderRadius: 12,
+              padding: "12px 14px",
+              boxShadow: "0 12px 40px rgba(0,0,0,.5)",
+              color: C.bone,
+              fontSize: 14,
+              cursor: "pointer",
+              animation: "fabelFade .3s ease",
+            }}
+          >
+            <div style={{ fontSize: 11, letterSpacing: 2, color: "#ff8a84", marginBottom: 4 }}>❗ IMPORTANT · tap to open chat</div>
+            <b style={{ color: C.violet }}>{chatToast.name}</b> {chatToast.text || "🎤 sent a voice message"}
+          </div>
+        )}
+      </div>
     </>
   );
 
@@ -2030,6 +2286,9 @@ export default function App() {
       unread={chatUnread}
       important={chatImportant}
       setImportant={setChatImportant}
+      onSendVoice={sendVoice}
+      onMicError={onChatMicError}
+      voiceBusy={voiceBusy}
     />
   );
 
